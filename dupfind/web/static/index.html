@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>dupfind · 本地重复文件可视化</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">d</span>
+      <div class="brand-text">
+        <h1>dupfind</h1>
+        <p>本地重复文件可视化 · v1 只读</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="pill" id="serverPill">本地 · 只读</span>
+      <button class="ghost-btn" id="themeToggle" type="button" aria-label="切换深色模式">
+        <span id="themeIcon">◐</span><span id="themeLabel">深色</span>
+      </button>
+    </div>
+  </header>
+
+  <section class="summary" aria-label="扫描统计">
+    <div class="summary-tile">
+      <span class="summary-label">已扫文件</span>
+      <strong class="summary-value" id="statFiles">—</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">候选组</span>
+      <strong class="summary-value" id="statCandidates">—</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">确认组</span>
+      <strong class="summary-value" id="statConfirmed">—</strong>
+    </div>
+    <div class="summary-tile accent">
+      <span class="summary-label">可节省</span>
+      <strong class="summary-value" id="statSavings">—</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">排除 / 文件</span>
+      <strong class="summary-value" id="statExcluded">—</strong>
+    </div>
+    <div class="summary-tile">
+      <span class="summary-label">拒绝访问 / 错误</span>
+      <strong class="summary-value" id="statErrors">—</strong>
+    </div>
+    <div class="summary-flag" id="partialFlag" hidden>partial · 扫描未完成</div>
+  </section>
+
+  <main class="layout">
+    <div class="panel-grid">
+      <section class="card">
+        <div class="card-head">
+          <h2>扫描</h2>
+          <span class="hint" id="scanHint">只读遍历，不会移动或删除文件</span>
+        </div>
+        <form id="scanForm" class="form">
+          <div class="field">
+            <label for="rootInput">根路径</label>
+            <input id="rootInput" name="root" list="volumeList" placeholder="F:\" autocomplete="off" required />
+            <datalist id="volumeList"></datalist>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="minSizeInput">最小大小</label>
+              <input id="minSizeInput" name="minSize" placeholder="1KB" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="maxDepthInput">递归深度</label>
+              <input id="maxDepthInput" name="maxDepth" placeholder="不限" inputmode="numeric" autocomplete="off" />
+            </div>
+          </div>
+          <div class="switch-row">
+            <label class="switch">
+              <input type="checkbox" id="noHashInput" />
+              <span class="switch-track"></span>
+              <span class="switch-text">跳过哈希（结论为疑似）</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="contentOnlyInput" />
+              <span class="switch-track"></span>
+              <span class="switch-text">忽略文件名规则（全内容比对）</span>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button class="primary-btn" id="startBtn" type="submit">开始扫描</button>
+            <button class="secondary-btn" id="cancelBtn" type="button" hidden>取消扫描</button>
+          </div>
+        </form>
+
+        <div class="progress" id="progress" hidden>
+          <div class="progress-head">
+            <span class="progress-phase" id="phaseLabel">遍历中</span>
+            <span class="progress-ratio" id="progressDetail">0 个文件</span>
+          </div>
+          <div class="progress-bar" id="progressBar"><span></span></div>
+          <div class="progress-stats">
+            <span>候选组 <b id="liveCandidates">0</b></span>
+            <span>确认组 <b id="liveConfirmed">0</b></span>
+            <span>排除 <b id="liveExcluded">0</b></span>
+            <span>拒绝访问 <b id="liveDenied">0</b></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>报告</h2>
+          <span class="hint">扫描完成后自动加载，也可手动指定 JSON</span>
+        </div>
+        <div class="field">
+          <label for="reportPathInput">报告文件路径</label>
+          <input id="reportPathInput" placeholder="dupfind-reports\scan-*.json" autocomplete="off" />
+        </div>
+        <div class="form-actions">
+          <button class="primary-btn" id="loadReportBtn" type="button">加载报告</button>
+        </div>
+        <dl class="report-meta" id="reportMeta">
+          <div><dt>根路径</dt><dd id="metaRoot">—</dd></div>
+          <div><dt>报告</dt><dd id="metaPath">—</dd></div>
+          <div><dt>内容比对</dt><dd id="metaHash">—</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    <section class="card toolbar" id="toolbar" hidden>
+      <div class="toolbar-row">
+        <div class="search">
+          <span class="search-icon" aria-hidden="true">⌕</span>
+          <input id="searchInput" type="search" placeholder="搜索文件名或路径…" autocomplete="off" aria-label="搜索文件名或路径" />
+        </div>
+        <div class="segmented" id="statusFilter" role="group" aria-label="按状态筛选">
+          <button type="button" data-status="all" class="segment active">全部 <span data-count="all">0</span></button>
+          <button type="button" data-status="confirmed" class="segment">确认 <span data-count="confirmed">0</span></button>
+          <button type="button" data-status="suspect" class="segment">疑似 <span data-count="suspect">0</span></button>
+          <button type="button" data-status="shared" class="segment">硬链接 <span data-count="shared">0</span></button>
+        </div>
+      </div>
+      <div class="toolbar-row second">
+        <label class="inline-field">
+          <span>最小可节省</span>
+          <input id="minSavingsInput" placeholder="0" autocomplete="off" />
+        </label>
+        <label class="inline-field">
+          <span>保留策略</span>
+          <select id="keepSelect">
+            <option value="shortest">最短名称</option>
+            <option value="newest">最新修改</option>
+          </select>
+        </label>
+        <span class="result-count" id="resultCount">0 组</span>
+      </div>
+    </section>
+
+    <section class="groups" id="groupList" aria-live="polite"></section>
+    <div class="empty" id="emptyState">
+      <div class="empty-icon" aria-hidden="true">◍</div>
+      <h3>还没有报告</h3>
+      <p>选择盘符开始扫描，或在上方加载已有报告 JSON。</p>
+    </div>
+    <div class="load-more-wrap" id="loadMoreWrap" hidden>
+      <button class="secondary-btn" id="loadMoreBtn" type="button">加载更多</button>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span>dupfind web v1 · 只读</span>
+    <span>扫描与浏览均在本地完成，不联网</span>
+  </footer>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

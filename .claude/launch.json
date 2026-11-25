@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dupfind-web",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "dupfind.web", "--port", "8123"],
+      "port": 8123
+    }
+  ]
+}

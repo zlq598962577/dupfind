@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dupfind"
+version = "0.1.0"
+description = "Windows single-volume duplicate file finder and cleaner"
+requires-python = ">=3.11"
+dependencies = ["typer>=0.9"]
+
+[project.optional-dependencies]
+blake3 = ["blake3>=0.4"]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
+
+[project.scripts]
+dupfind = "dupfind.cli:main"
+dupfind-web = "dupfind.web.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["dupfind*"]
+
+[tool.setuptools.package-data]
+"dupfind.web" = ["static/*"]

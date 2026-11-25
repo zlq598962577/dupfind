@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# dupfind 运行时产物（含真实文件路径，不应入库）
+.dupfind-cache
+dupfind-reports/
+dupfind.toml
+.screenshots/
