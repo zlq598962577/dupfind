@@ -577,23 +577,76 @@ def test_restore_directory_finds_journal_only_manifest(tmp_path):
 
 
 def test_empty_purge_keeps_manifests_when_payload_fails(tmp_path):
-    """payload 删不掉时不能连 manifest 一起删 —— 那些文件还要靠它还原。"""
-    import stat
+    """payload 删不掉时不能连 manifest 一起删 —— 那些文件还要靠它还原。
 
+    用「独占句柄占住文件」制造真正的删除失败：只读属性不再是失败原因，
+    ``remove_file`` 会先清掉只读位（见下一个用例）。
+    """
     from dupfind.restore import EmptyOptions, run_empty
+    from dupfind.win32 import close_handle, open_exclusive
 
     trash = tmp_path / "trash"
     payload = trash / "C" / "a.bin"
     payload.parent.mkdir(parents=True)
     payload.write_bytes(b"x")
     manifest = _write_manifest(trash, [])
-    # 只读属性会让 os.unlink 在 Windows 上失败
-    os.chmod(payload, stat.S_IREAD)
 
-    code = run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=False))
+    handle = open_exclusive(str(payload))
+    try:
+        code = run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=False))
+    finally:
+        close_handle(handle)
+
     assert code == 2
     assert manifest.is_file(), "删除失败时 manifest 被一并删掉了"
-    assert payload.is_file(), "前提不成立：只读文件被删掉了，测试没覆盖到失败分支"
+    assert payload.is_file(), "前提不成立：被占用的文件被删掉了，测试没覆盖到失败分支"
+
+
+def test_empty_removes_readonly_files(tmp_path):
+    """只读文件必须能被删掉。
+
+    微信/QQ 收到的文件、很多安装包都带只读位，而 Windows 上 ``os.unlink``
+    对只读文件一律返回 ``WinError 5``。不清掉这一位，「清空隔离区」会对
+    这类文件全部失败，用户看到的是「永远删不掉」。
+    """
+    import stat
+
+    from dupfind.restore import EmptyOptions, run_empty
+
+    trash = tmp_path / "trash"
+    payload = trash / "E" / "wechat" / "NETOBDCBAK5.zip"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"x" * 100)
+    os.chmod(payload, stat.S_IREAD)
+    _write_manifest(trash, [])
+
+    code = run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=True))
+
+    assert code == 0, "只读文件导致清空失败"
+    assert not payload.exists(), "只读文件没有被删除"
+    assert not (trash / "E").exists(), "空目录没有被清理"
+
+
+def test_empty_reports_why_a_file_could_not_be_removed(tmp_path, capsys):
+    """删除失败时要说明是哪个文件、什么原因，否则用户只看到「失败 1」无从下手。"""
+    from dupfind.restore import EmptyOptions, run_empty
+    from dupfind.win32 import close_handle, open_exclusive
+
+    trash = tmp_path / "trash"
+    payload = trash / "C" / "locked.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"x")
+    _write_manifest(trash, [])
+
+    handle = open_exclusive(str(payload))
+    try:
+        run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=True))
+    finally:
+        close_handle(handle)
+
+    output = capsys.readouterr().out
+    assert "locked.bin" in output
+    assert "[失败]" in output
 
 
 def test_restore_idempotent_when_journal_present(tmp_path):

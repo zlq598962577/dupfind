@@ -418,6 +418,31 @@ def test_empty_endpoint_requires_confirm(client, report_path, tmp_path):
     assert not any(path.is_file() for path in trash.rglob("*") if path.suffix != ".json")
 
 
+def test_empty_endpoint_reports_which_file_failed(client, report_path, tmp_path):
+    """清空失败时要把具体文件和原因带回前端，只说「部分失败」用户无从处理。"""
+    from dupfind.win32 import close_handle, open_exclusive
+
+    trash = tmp_path / "trash"
+    applied = client.post(
+        "/api/apply",
+        json={"reportPath": str(report_path), "keep": "shortest", "trash": str(trash), "confirm": True},
+    )
+    assert applied.status_code == 200, applied.text
+    assert _wait(client, applied.json()["id"])["state"] == "succeeded"
+
+    payload_file = next(path for path in trash.rglob("*") if path.is_file() and path.suffix != ".json")
+    handle = open_exclusive(str(payload_file))
+    try:
+        response = client.post("/api/empty", json={"trash": str(trash), "confirm": True})
+        assert response.status_code == 200, response.text
+        task = _wait(client, response.json()["id"])
+    finally:
+        close_handle(handle)
+
+    assert task["state"] == "failed"
+    assert payload_file.name in task["error"], "失败原因没有指明具体文件"
+
+
 def test_disposal_state_endpoint_404(client):
     assert client.get("/api/disposal/nope").status_code == 404
     assert client.get("/api/disposal").status_code == 404

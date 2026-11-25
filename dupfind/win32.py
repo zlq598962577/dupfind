@@ -68,6 +68,7 @@ _MoveFileExW = _kernel32.MoveFileExW
 _MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
 _MoveFileExW.restype = wintypes.BOOL
 
+FILE_ATTRIBUTE_READONLY = 0x00000001
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 OPEN_ALWAYS = 4
 ERROR_SHARING_VIOLATION = 32
@@ -163,6 +164,48 @@ def open_exclusive(path: str) -> int:
 
 def close_handle(handle: int) -> None:
     _CloseHandle(handle)
+
+
+_SetFileAttributesW = _kernel32.SetFileAttributesW
+_SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+_SetFileAttributesW.restype = wintypes.BOOL
+
+_GetFileAttributesW = _kernel32.GetFileAttributesW
+_GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+_GetFileAttributesW.restype = wintypes.DWORD
+
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+
+
+def remove_file(path: str) -> None:
+    """删除文件，必要时先清掉只读属性。
+
+    Windows 上 ``os.unlink`` 对只读文件直接返回 ``WinError 5``。隔离区里的
+    文件是从用户目录搬过来的，微信/QQ 收到的文件、以及很多安装包都带只读位，
+    于是 ``empty`` 会对它们全部失败，用户看到「清空隔离区」永远删不掉。
+
+    只清 ``FILE_ATTRIBUTE_READONLY`` 这一位，其它属性（隐藏/系统）保持不动；
+    属性都清不掉时把原始异常抛出去，让上层如实计入失败数。
+    """
+    target = long_path(path)
+    try:
+        os.unlink(target)
+        return
+    except PermissionError:
+        pass
+    attributes = _GetFileAttributesW(target)
+    if attributes == INVALID_FILE_ATTRIBUTES:
+        # 连属性都读不到（文件已消失、或被占用），让 unlink 自己抛原始错误
+        os.unlink(target)
+        return
+    if not attributes & FILE_ATTRIBUTE_READONLY:
+        # 不是只读导致的失败：被占用、权限不足等，重试也不会有用
+        os.unlink(target)
+        return
+    if not _SetFileAttributesW(target, attributes & ~FILE_ATTRIBUTE_READONLY):
+        os.unlink(target)
+        return
+    os.unlink(target)
 
 
 def scandir(path: str) -> list[os.DirEntry]:

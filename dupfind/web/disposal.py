@@ -442,10 +442,14 @@ class DisposalTaskManager:
     ) -> None:
         try:
             task.phase = "emptying"
-            with capture():
+            with capture() as output:
                 code = run_empty(trash, options)
             task.message = "隔离区已清空" if code == 0 else "部分文件删除失败"
             task.state = "failed" if code == 2 else "succeeded"
+            if code == 2:
+                # 把逐文件的失败原因带给前端。只说「部分文件删除失败」，用户
+                # 不知道是哪个文件、为什么删不掉，也就无从处理。
+                task.error = _failure_detail(output.getvalue())
         except (RestoreError, OSError) as exc:
             task.state = "failed"
             task.error = str(exc)
@@ -456,6 +460,17 @@ class DisposalTaskManager:
             lock.release()
             task.phase = "done"
             task.finished_at = time.time()
+
+
+def _failure_detail(output: str, limit: int = 5) -> str:
+    """从 CLI 输出里挑出 ``[失败]`` 行，作为给用户看的原因。"""
+    lines = [line.strip() for line in output.splitlines() if "[失败]" in line]
+    if not lines:
+        return "部分文件删除失败"
+    shown = lines[:limit]
+    if len(lines) > limit:
+        shown.append(f"…… 另有 {len(lines) - limit} 个")
+    return "\n".join(shown)
 
 
 def validate_trash_path(trash: str) -> str:

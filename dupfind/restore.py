@@ -26,7 +26,7 @@ from .models import FILE_ATTRIBUTE_REPARSE_POINT
 from .safety import canonical, protected_reason
 from .trash import TrashError, validate_source_path
 from .units import format_size, iso_now
-from .win32 import long_path, move_file, strip_long_prefix
+from .win32 import long_path, move_file, remove_file, strip_long_prefix
 
 MANIFEST_GLOB = "manifest-*.json"
 JOURNAL_SUFFIX = ".journal"
@@ -592,10 +592,14 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
 
     for path in files:
         try:
-            os.unlink(long_path(str(path)))
+            # 不能直接用 os.unlink：隔离区里的文件常带只读位（微信/QQ 收的文件、
+            # 安装包），Windows 上对只读文件 unlink 一律 WinError 5，
+            # 「清空隔离区」就会永远失败。remove_file 会先清掉只读属性。
+            remove_file(str(path))
             stats.removed_files += 1
-        except OSError:
+        except OSError as exc:
             stats.failed += 1
+            say(f"  [失败] {path} —— {exc}")
 
     # 顺序要紧：先删 payload 再删 manifest。否则 journal 的目录先被清空，
     # 后面删除 manifest 失败时，还原记录就丢了。
@@ -606,9 +610,10 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
         else:
             for path in manifests:
                 try:
-                    os.unlink(long_path(str(path)))
-                except OSError:
+                    remove_file(str(path))
+                except OSError as exc:
                     stats.failed += 1
+                    say(f"  [失败] {path} —— {exc}")
 
     _prune_empty_dirs(root)
 
