@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .console import say
 from .jsonio import read_json, write_json_atomic
 from .models import FILE_ATTRIBUTE_REPARSE_POINT
 from .safety import canonical, protected_reason
@@ -325,13 +326,13 @@ def run_restore(target: str | Path, options: RestoreOptions) -> int:
     documents = [load_manifest(path) for path in discover_manifests(target)]
     stats = RestoreStats()
 
-    print(f"模式: {'dry-run（不移动）' if options.dry_run else '实际还原'}")
+    say(f"模式: {'dry-run（不移动）' if options.dry_run else '实际还原'}")
     for document in documents:
-        print(f"\nmanifest: {document.path}")
-        print(f"trash:    {document.trash}")
+        say(f"\nmanifest: {document.path}")
+        say(f"trash:    {document.trash}")
         pending = document.restorable
         if not pending:
-            print("  没有待还原的动作。")
+            say("  没有待还原的动作。")
             continue
 
         changed = False
@@ -348,9 +349,9 @@ def run_restore(target: str | Path, options: RestoreOptions) -> int:
         if changed:
             _persist(document)
 
-    print()
+    say()
     prefix = "（dry-run：未移动任何文件）" if options.dry_run else ""
-    print(
+    say(
         f"完成：还原 {stats.restored} 个文件，{format_size(stats.restored_bytes)}；"
         f"跳过 {stats.skipped}，缺失 {stats.missing}，失败 {stats.failed} {prefix}".rstrip()
     )
@@ -364,7 +365,7 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
     problem = _validate_action(action, trash)
     if problem is not None:
         stats.failed += 1
-        print(f"  [拒绝] {action.src} —— {problem}")
+        say(f"  [拒绝] {action.src} —— {problem}")
         return "failed"
 
     src_exists = os.path.exists(long_path(action.src))
@@ -372,17 +373,17 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
     if src_exists and dst_exists and os.path.samefile(long_path(action.src), long_path(action.dst)):
         # 同一物理文件（硬链接或已还原），无需移动
         stats.skipped += 1
-        print(f"  [已是同一文件] {action.src}")
+        say(f"  [已是同一文件] {action.src}")
         return "skipped"
 
     # 幂等：原位置已有文件、隔离区已无文件 → 视为已还原
     if src_exists and not dst_exists:
         stats.skipped += 1
-        print(f"  [已还原] {action.src}")
+        say(f"  [已还原] {action.src}")
         return "skipped"
     if not dst_exists:
         stats.missing += 1
-        print(f"  [缺失] {action.dst} 不存在，跳过")
+        say(f"  [缺失] {action.dst} 不存在，跳过")
         return "missing"
 
     target = action.src
@@ -390,7 +391,7 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
     if src_exists:
         if options.on_conflict == "skip":
             stats.skipped += 1
-            print(f"  [冲突] {action.src} 已存在，跳过（可用 --on-conflict rename 另存）")
+            say(f"  [冲突] {action.src} 已存在，跳过（可用 --on-conflict rename 另存）")
             return "skipped"
         if options.on_conflict == "rename":
             target = _conflict_target(action.src)
@@ -400,18 +401,18 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
     # dry-run 必须在任何写操作之前返回 —— 否则 overwrite 会真的删掉文件
     if options.dry_run:
         verb = "覆盖并还原" if replace else "还原"
-        print(f"  [DRY-RUN] {verb} {action.dst} -> {target}")
+        say(f"  [DRY-RUN] {verb} {action.dst} -> {target}")
         stats.restored += 1
         stats.restored_bytes += action.size
         return "restored"
 
     if not _move_back(target, action.dst, replace=replace):
         stats.failed += 1
-        print(f"  [失败] {action.dst} -> {target}")
+        say(f"  [失败] {action.dst} -> {target}")
         return "failed"
     stats.restored += 1
     stats.restored_bytes += action.size
-    print(f"  [还原] {action.dst} -> {target}")
+    say(f"  [还原] {action.dst} -> {target}")
     return "restored"
 
 
@@ -446,7 +447,7 @@ def _persist(document: ManifestDocument) -> None:
     try:
         write_json_atomic(document.path, payload)
     except OSError as exc:
-        print(f"  [警告] 无法写回 manifest：{exc}")
+        say(f"  [警告] 无法写回 manifest：{exc}")
         return
     # journal 里的旧状态会覆盖刚写回的快照（load_manifest 中 journal 优先），
     # 不删掉的话下次执行看到的仍是 completed，写回等于白做。
@@ -485,49 +486,73 @@ def _validate_trash(trash: str) -> str:
     return os.path.abspath(trash)
 
 
-def run_empty(trash: str, options: EmptyOptions) -> int:
-    root = _validate_trash(trash)
-    if not os.path.isdir(root):
-        print(f"trash 目录不存在：{root}")
-        return 1
+def _collect_trash(root: str) -> tuple[list[Path], list[Path], int, int]:
+    """枚举隔离区里的 payload 与 manifest。
 
-    stats = EmptyStats()
+    手工递归而不用 ``os.walk``，原因有两条：
+
+    * ``os.walk`` 在 Windows 上会跟随 junction（Python 3.11 实测），
+      指向隔离区之外的目录会被一起遍历甚至删除；
+    * ``os.walk`` 传入的根路径没有 ``\\\\?\\`` 前缀，镜像目录一旦超过 260
+      字符，深层的文件根本列不出来 —— 隔离区看起来「清空完成」，文件却还在。
+
+    manifest 只认 trash 根目录下、dupfind 自己命名的文件；嵌套的「manifest-」
+    文件是用户数据，不能当成还原记录，也不能拿它当「这是隔离区」的证据。
+    """
     files: list[Path] = []
     manifests: list[Path] = []
     skipped_links = 0
-    for current, dirs, names in os.walk(root):
-        # 关键：os.walk 在 Windows 上会跟随 junction（Python 3.11 实测），
-        # 而 junction 指向的是隔离区之外的目录。不剪掉就会删到别人的文件。
-        kept_dirs = []
-        for name in dirs:
-            if _is_reparse_point(os.path.join(current, name)):
-                skipped_links += 1
-                continue
-            kept_dirs.append(name)
-        dirs[:] = kept_dirs
+    total_bytes = 0
 
+    def visit(current: str) -> None:
+        nonlocal skipped_links, total_bytes
+        try:
+            with os.scandir(long_path(current)) as iterator:
+                entries = list(iterator)
+        except OSError:
+            return
         at_root = _same_dir(current, root)
-        for name in names:
-            path = Path(current) / name
-            if _is_reparse_point(str(path)):
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    is_dir = True
+                else:
+                    is_dir = False
+            except OSError:
+                continue
+            if _is_reparse_point(entry.path):
                 skipped_links += 1
                 continue
-            # manifest 只认 trash 根目录下、dupfind 自己命名的文件；嵌套的
-            # 「manifest-」文件是用户数据，不能当成还原记录，也不能拿它当
-            # 「这是隔离区」的证据。manifest 一律排在 payload 之后删，否则
-            # 中途失败会留下「文件还在、还原记录已丢」的隔离区。
-            if at_root and _MANIFEST_NAME.match(path.name):
-                manifests.append(path)
-                if options.keep_manifests:
-                    stats.kept_manifests += 1
+            if is_dir:
+                visit(entry.path)
                 continue
-            files.append(path)
+            if at_root and _MANIFEST_NAME.match(path.name):
+                manifests.append(Path(strip_long_prefix(entry.path)))
+                continue
+            files.append(Path(strip_long_prefix(entry.path)))
             try:
-                stats.removed_bytes += path.stat().st_size
+                total_bytes += entry.stat(follow_symlinks=False).st_size
             except OSError:
                 pass
+
+    visit(root)
+    return files, manifests, skipped_links, total_bytes
+
+
+def run_empty(trash: str, options: EmptyOptions) -> int:
+    root = _validate_trash(trash)
+    if not os.path.isdir(long_path(root)):
+        say(f"trash 目录不存在：{root}")
+        return 1
+
+    stats = EmptyStats()
+    files, manifests, skipped_links, total_bytes = _collect_trash(root)
+    stats.removed_bytes = total_bytes
+    if options.keep_manifests:
+        stats.kept_manifests = len(manifests)
     if skipped_links:
-        print(f"跳过 {skipped_links} 个符号链接/junction（不跟随，避免越界删除）")
+        say(f"跳过 {skipped_links} 个符号链接/junction（不跟随，避免越界删除）")
 
     # 真正的隔离区一定有 manifest。没有 manifest 的目录不是隔离区 —— 多半是
     # 用户把路径写错成了资料目录（dupfind empty D:\照片），这是不可逆操作，
@@ -537,28 +562,32 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
             f"目录根下没有 dupfind 的 manifest-<时间戳>.json，看起来不是隔离区，拒绝清空: {root}"
         )
 
-    print(f"trash: {root}")
-    print(f"模式: {'dry-run（不删除）' if options.dry_run else '实际删除'}")
-    print(f"待删除 {len(files)} 个文件，{format_size(stats.removed_bytes)}")
+    say(f"trash: {root}")
+    say(f"模式: {'dry-run（不删除）' if options.dry_run else '实际删除'}")
+    say(f"待删除 {len(files)} 个文件，{format_size(stats.removed_bytes)}")
     if manifests:
         if options.keep_manifests:
-            print(f"保留 {len(manifests)} 个 manifest（还原记录；用 --purge-manifests 一并删除）")
+            say(f"保留 {len(manifests)} 个 manifest（还原记录；用 --purge-manifests 一并删除）")
         else:
-            print(f"另有 {len(manifests)} 个 manifest 将一并删除")
+            say(f"另有 {len(manifests)} 个 manifest 将一并删除")
 
     if not files and not (manifests and not options.keep_manifests):
-        print("没有可删除的文件。")
+        # 没有 payload 可删时仍然清理空目录：restore 之后镜像目录会留下空壳
+        # （trash\C\Users\...），不清掉的话隔离区看起来还是一堆东西。
+        if not options.dry_run:
+            _prune_empty_dirs(root)
+        say("没有可删除的文件。")
         return 0
 
     if options.dry_run:
         for path in files[:20]:
-            print(f"  [DRY-RUN] 删除 {path}")
+            say(f"  [DRY-RUN] 删除 {path}")
         if len(files) > 20:
-            print(f"  …… 另有 {len(files) - 20} 个文件")
+            say(f"  …… 另有 {len(files) - 20} 个文件")
         if not options.keep_manifests:
             for path in manifests:
-                print(f"  [DRY-RUN] 删除 {path}")
-        print("\n（dry-run：未删除任何文件，加 --no-dry-run 执行）")
+                say(f"  [DRY-RUN] 删除 {path}")
+        say("\n（dry-run：未删除任何文件，加 --no-dry-run 执行）")
         return 0
 
     for path in files:
@@ -573,7 +602,7 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
     if not options.keep_manifests:
         if stats.failed:
             # 有 payload 删不掉时，它的还原记录还有用，不能一并清掉
-            print(f"  有 {stats.failed} 个文件删除失败，保留全部 manifest 以便还原")
+            say(f"  有 {stats.failed} 个文件删除失败，保留全部 manifest 以便还原")
         else:
             for path in manifests:
                 try:
@@ -583,7 +612,7 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
 
     _prune_empty_dirs(root)
 
-    print(
+    say(
         f"\n完成：删除 {stats.removed_files} 个文件，释放 {format_size(stats.removed_bytes)}；"
         f"失败 {stats.failed}"
     )

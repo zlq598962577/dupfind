@@ -120,15 +120,7 @@ class Manifest:
     __slots__ = ("_path", "_journal_path", "_data", "_journal", "_dirty")
 
     def __init__(self, trash_dir: str, report_path: str) -> None:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        candidate = ntpath.join(trash_dir, f"manifest-{timestamp}.json")
-        suffix = 2
-        while os.path.exists(candidate) or os.path.exists(candidate + self.JOURNAL_SUFFIX):
-            candidate = ntpath.join(trash_dir, f"manifest-{timestamp}-{suffix}.json")
-            suffix += 1
-        self._path = candidate
-        self._journal_path = candidate + self.JOURNAL_SUFFIX
-        self._journal = None
+        self._journal, self._path, self._journal_path = self._reserve(trash_dir)
         self._dirty = False
         self._data: dict[str, object] = {
             "version": MANIFEST_VERSION,
@@ -137,6 +129,43 @@ class Manifest:
             "trash": trash_dir,
             "actions": [],
         }
+
+    @staticmethod
+    def _reserve(trash_dir: str) -> tuple[object, str, str]:
+        """**原子地**占下一个 manifest 名字，返回 (journal 句柄, 快照路径, journal 路径)。
+
+        不能用「``os.path.exists`` 探测再创建」：两个 apply 在同一秒启动时都
+        探测到同一个名字可用，随后共用一份 manifest —— 一个任务的 save 会
+        覆盖另一个的 actions，共享的 journal 又被先完成者删掉，已移走的文件
+        从此没有还原记录，只剩被 ``empty`` 永久删除一条路。
+
+        ``O_CREAT | O_EXCL`` 让「占名」这一步由内核保证互斥：谁先建成 journal
+        谁就拿到这个名字，输的那个换下一个后缀重试。
+        """
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        for suffix in range(1, 1000):
+            name = f"manifest-{timestamp}.json" if suffix == 1 else f"manifest-{timestamp}-{suffix}.json"
+            snapshot = ntpath.join(trash_dir, name)
+            journal_path = snapshot + Manifest.JOURNAL_SUFFIX
+            try:
+                # 快照文件也必须不存在：否则后续 save() 会覆盖别人的记录
+                handle = os.open(
+                    long_path(journal_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_APPEND,
+                    0o666,
+                )
+            except FileExistsError:
+                continue
+            if os.path.exists(long_path(snapshot)):
+                # journal 建成了但同名快照已存在（旧版遗留），放掉重来
+                os.close(handle)
+                try:
+                    os.unlink(long_path(journal_path))
+                except OSError:
+                    pass
+                continue
+            return os.fdopen(handle, "a", encoding="utf-8", newline="\n"), snapshot, journal_path
+        raise TrashError(f"无法在隔离区内分配 manifest 文件名: {trash_dir}")
 
     @property
     def path(self) -> str:
@@ -207,7 +236,12 @@ class Manifest:
                 pass
 
     def close(self) -> None:
-        """收尾：有改动才落快照，否则只关句柄。"""
+        """收尾：有改动才落快照；一个动作都没做就删掉占位用的空 journal。
+
+        ``_reserve`` 会先建出 journal 文件来「占名」，如果整次处置没有任何
+        文件被移动（全部跳过、或计划为空），这个空 journal 没有任何还原
+        价值，留着只会让 ``restore`` 多出一个「没有待还原的动作」的 manifest。
+        """
         if self._dirty:
             self.save()
         elif self._journal is not None:
@@ -216,3 +250,7 @@ class Manifest:
             except OSError:
                 pass
             self._journal = None
+            try:
+                os.unlink(long_path(self._journal_path))
+            except OSError:
+                pass

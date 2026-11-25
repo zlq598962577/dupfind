@@ -37,10 +37,17 @@ def build_view(document: ReportDocument) -> dict[str, Any]:
 
         clusters = physical_clusters(group)
         keepers: dict[str, str] = {}
+        # 每种策略下「实际会被移动的文件数」。前端 action bar 要用它，而不是
+        # files.length - 1 —— 保留簇可能包含多个硬链接路径（整簇保留），
+        # unstable 文件也不参与，用 -1 估算会偏大。
+        removal_counts: dict[str, int] = {}
         if len(clusters) >= 2:
             for mode in KEEP_MODES:
                 keep_cluster = choose_keep_cluster(clusters, mode)
                 keepers[mode] = choose_keep(keep_cluster, mode).path
+                removal_counts[mode] = sum(
+                    len(cluster) for cluster in clusters if cluster is not keep_cluster
+                )
 
         groups.append(
             {
@@ -50,6 +57,7 @@ def build_view(document: ReportDocument) -> dict[str, Any]:
                 "savingsBytes": group.savings_bytes,
                 "physicalCount": len(clusters),
                 "keepers": keepers,
+                "removalCounts": removal_counts,
                 "files": [
                     _file_payload(
                         item.path,

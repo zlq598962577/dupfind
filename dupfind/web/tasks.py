@@ -17,6 +17,8 @@ from ..report import build_report, write_report
 
 MAX_TASKS = 20
 DEFAULT_THREADS = 4
+DRIVE_REMOVABLE = 2
+DRIVE_FIXED = 3
 
 
 class TaskError(RuntimeError):
@@ -112,14 +114,25 @@ class ScanTaskManager:
         return self._last_report
 
     def volumes(self) -> list[str]:
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        """本地可选的盘符。
+
+        只用 ``GetDriveTypeW`` 判断，**不要** ``os.path.isdir``：断开的映射网络
+        盘（DRIVE_REMOTE）在 isdir 上会等 SMB 超时，实测每个 20 秒以上，整个
+        ``/api/meta`` 因此卡住，前端首屏一直空着。GetDriveTypeW 是纯注册表查询，
+        毫秒级返回。
+
+        只列固定盘与可移动盘：网络盘与本工具「单卷」的定位不符，且扫描一个
+        网络共享代价不可控。
+        """
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
         volumes: list[str] = []
         for index in range(26):
-            if mask & (1 << index):
-                letter = chr(ord("A") + index)
-                candidate = f"{letter}:\\"
-                if os.path.isdir(candidate):
-                    volumes.append(candidate)
+            if not mask & (1 << index):
+                continue
+            candidate = f"{chr(ord('A') + index)}:\\"
+            if kernel32.GetDriveTypeW(candidate) in (DRIVE_FIXED, DRIVE_REMOVABLE):
+                volumes.append(candidate)
         return volumes
 
     def start(

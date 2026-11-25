@@ -33,7 +33,9 @@ def select_port(host: str, preferred: int) -> int | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="dupfind-web", description="dupfind 本地可视化界面（v1 只读）")
+    parser = argparse.ArgumentParser(
+        prog="dupfind-web", description="dupfind 本地可视化界面（扫描、处置与还原）"
+    )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址，默认 {DEFAULT_HOST}")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口，默认 {DEFAULT_PORT}")
     parser.add_argument("--report-dir", default="", help="扫描报告目录，默认工作目录下 dupfind-reports")
@@ -56,7 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     report_dir = Path(args.report_dir) if args.report_dir else Path.cwd() / "dupfind-reports"
     app = create_app(ScanTaskManager(report_dir))
     print(f"dupfind web 启动中：http://{args.host}:{port}")
-    print(f"报告目录：{report_dir}（只读模式，不会删除或移动任何文件）")
+    print(f"报告目录：{report_dir}")
+    print("处置的文件先移入 <盘符>:\\_dupfind_trash，清空隔离区后才真正释放空间。")
     uvicorn.run(app, host=args.host, port=port, log_level="warning")
     return 0
 

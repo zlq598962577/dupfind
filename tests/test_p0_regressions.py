@@ -638,6 +638,20 @@ def test_trash_directory_is_excluded_from_scan(tmp_path):
     assert excluder.dir_reason(r"D:\data\_dupfind_trash", "_dupfind_trash") is not None
 
 
+def test_report_directory_is_excluded_from_scan(tmp_path):
+    """Web 产出的 dupfind-reports 是工具自己的数据，不能被当成待去重文件。
+
+    两份内容一致的报告会被报成一组重复文件；更糟的是处置时会移动报告本身，
+    让用户随后的「加载报告」失败。
+    """
+    from dupfind.config import Config
+    from dupfind.exclude import Excluder
+
+    excluder = Excluder(Config(), "D:\\")
+    assert excluder.dir_reason(r"D:\dupfind-reports", "dupfind-reports") is not None
+    assert excluder.dir_reason(r"D:\proj\dupfind-reports", "dupfind-reports") is not None
+
+
 def test_trash_target_detects_collision_on_long_path(tmp_path):
     """长路径（>260）下已存在的镜像目标也必须被检测到，不能静默覆盖旧文件。"""
     from dupfind.trash import TrashManager

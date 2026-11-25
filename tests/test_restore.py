@@ -697,6 +697,32 @@ def test_empty_prunes_empty_dirs(tmp_path):
     assert trash.is_dir()
 
 
+def test_empty_deletes_files_beyond_max_path(tmp_path):
+    r"""镜像目录可能超过 260 字符：不带 ``\\?\`` 前缀遍历会漏掉这些文件。
+
+    ``os.walk`` 拿到的是普通路径，深层文件根本列不出来，于是 empty 打印
+    「删除 0 个文件」并返回 0，用户以为空间释放了，文件其实还在隔离区。
+    """
+    from dupfind.restore import EmptyOptions, run_empty
+    from dupfind.win32 import long_path
+
+    trash = tmp_path / "trash"
+    deep = trash / "C"
+    for index in range(11):
+        deep = deep / (f"p{index:02d}_" + "a" * 18)
+    os.makedirs(long_path(str(deep)))
+    deep_file = deep / "buried.bin"
+    assert len(str(deep_file)) > 260
+    with open(long_path(str(deep_file)), "w", encoding="utf-8") as handle:
+        handle.write("x" * 10)
+    _write_manifest(trash, [])
+
+    code = run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=True))
+    assert code == 0
+    assert not os.path.exists(long_path(str(deep_file))), "超过 260 字符的文件没有被删除"
+    assert not (trash / "C").exists(), "深层空目录没有被清理"
+
+
 # ---------------------------------------------------------------------------
 # 数据丢失风险（审查发现）
 # ---------------------------------------------------------------------------

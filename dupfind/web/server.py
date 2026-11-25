@@ -1,4 +1,4 @@
-"""FastAPI 应用：单页静态资源 + 只读 JSON API。"""
+"""FastAPI 应用：单页静态资源 + 扫描/浏览/处置 API。"""
 
 from __future__ import annotations
 
@@ -12,13 +12,26 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .. import __version__
+from ..apply import ApplyOptions, ExecutionError
+from ..config import ConfigError, load_config
 from ..report import ReportError, load_report
+from ..restore import CONFLICT_MODES, EmptyOptions, RestoreError, RestoreOptions
 from ..units import parse_size
+from .disposal import (
+    CONFIRM_THRESHOLD_BYTES,
+    CONFIRM_THRESHOLD_FILES,
+    DisposalTaskManager,
+    TrashBusy,
+    build_preview,
+    default_trash_for,
+    validate_trash_path,
+)
 from .report_view import build_view
 from .tasks import ScanTaskManager
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_REPORT_BYTES = 256 * 1024 * 1024
+KEEP_MODES = ("shortest", "newest")
 
 
 class ScanPayload(BaseModel):
@@ -27,6 +40,35 @@ class ScanPayload(BaseModel):
     noHash: bool = False
     contentOnly: bool = False
     maxDepth: int | None = None
+
+
+class PreviewPayload(BaseModel):
+    """预览请求：勾选的组 + 保留策略 + 隔离区。"""
+
+    reportPath: str = Field(..., min_length=1)
+    groupIds: list[int] | None = None
+    keep: str = "shortest"
+    trash: str = ""
+    minSavings: str = "0"
+
+
+class ApplyPayload(PreviewPayload):
+    """执行请求：在预览的基础上要求 ``confirm`` 明确确认。"""
+
+    confirm: bool = False
+    verifyContent: bool = True
+
+
+class RestorePayload(BaseModel):
+    trash: str = Field(..., min_length=1)
+    onConflict: str = "skip"
+    dryRun: bool = False
+
+
+class EmptyPayload(BaseModel):
+    trash: str = Field(..., min_length=1)
+    purgeManifests: bool = False
+    confirm: bool = False
 
 
 def _validate_root(root: str) -> str:
@@ -48,10 +90,41 @@ def _validate_report_path(raw: str) -> Path:
     return path
 
 
-def create_app(manager: ScanTaskManager | None = None) -> FastAPI:
+def _apply_options(payload: PreviewPayload) -> ApplyOptions:
+    """把请求体转成 ApplyOptions，顺便校验参数。"""
+    keep = payload.keep.lower()
+    if keep not in KEEP_MODES:
+        raise HTTPException(status_code=400, detail=f"保留策略必须是 {', '.join(KEEP_MODES)} 之一")
+    try:
+        min_savings = parse_size(payload.minSavings or "0")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"min-savings 无法解析: {exc}") from exc
+    return ApplyOptions(
+        trash_dir=payload.trash or "",
+        keep_mode=keep,
+        dry_run=True,
+        assume_yes=True,
+        min_savings=min_savings,
+    )
+
+
+def _resolve_trash(payload: PreviewPayload, document) -> str:
+    trash = payload.trash.strip() or default_trash_for(document.root)
+    try:
+        return validate_trash_path(trash)
+    except RestoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def create_app(
+    manager: ScanTaskManager | None = None,
+    disposal: DisposalTaskManager | None = None,
+) -> FastAPI:
     manager = manager or ScanTaskManager(Path.cwd() / "dupfind-reports")
+    disposal = disposal or DisposalTaskManager()
     app = FastAPI(title="dupfind web", version=__version__, docs_url=None, redoc_url=None)
     app.state.manager = manager
+    app.state.disposal = disposal
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @app.get("/", include_in_schema=False)
@@ -66,7 +139,9 @@ def create_app(manager: ScanTaskManager | None = None) -> FastAPI:
             "reportDir": str(manager.report_dir),
             "lastReport": manager.last_report(),
             "defaults": {"minSize": "1KB", "noHash": False, "contentOnly": False},
-            "keepModes": ["shortest", "newest"],
+            "keepModes": list(KEEP_MODES),
+            "confirmThreshold": {"files": CONFIRM_THRESHOLD_FILES, "bytes": CONFIRM_THRESHOLD_BYTES},
+            "lastDisposal": disposal.last().snapshot() if disposal.last() else None,
         }
 
     @app.post("/api/scan")
@@ -112,5 +187,117 @@ def create_app(manager: ScanTaskManager | None = None) -> FastAPI:
         except ReportError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return build_view(document)
+
+    # --- 处置闭环 ---------------------------------------------------
+
+    def _load_for_disposal(payload: PreviewPayload):
+        report_path = _validate_report_path(payload.reportPath)
+        try:
+            document = load_report(report_path)
+        except ReportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return document
+
+    @app.post("/api/apply/preview")
+    def apply_preview(payload: PreviewPayload) -> dict[str, object]:
+        """执行前预览：不写任何文件。"""
+        document = _load_for_disposal(payload)
+        options = _apply_options(payload)
+        options.trash_dir = _resolve_trash(payload, document)
+        try:
+            preview = build_preview(document, options, payload.groupIds)
+        except ExecutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return preview.to_dict()
+
+    @app.post("/api/apply")
+    def apply_start(payload: ApplyPayload) -> dict[str, object]:
+        document = _load_for_disposal(payload)
+        options = _apply_options(payload)
+        options.trash_dir = _resolve_trash(payload, document)
+        options.verify_content = payload.verifyContent
+        options.dry_run = False
+
+        try:
+            preview = build_preview(document, options, payload.groupIds)
+        except ExecutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if preview.fileCount == 0:
+            raise HTTPException(status_code=400, detail="没有可处置的文件")
+        # 规模超过阈值时必须显式确认 —— 与 CLI 的 DELETE 二次确认同等对待
+        if preview.requiresConfirmation and not payload.confirm:
+            raise HTTPException(
+                status_code=409,
+                detail=f"本次将移动 {preview.fileCount} 个文件、释放 {preview.freedText}，需要确认后再执行",
+            )
+        try:
+            task = disposal.start_apply(document, options, payload.groupIds)
+        except TrashBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return task.snapshot()
+
+    @app.get("/api/disposal/{task_id}")
+    def disposal_state(task_id: str) -> dict[str, object]:
+        task = disposal.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return task.snapshot()
+
+    @app.get("/api/disposal")
+    def disposal_last() -> dict[str, object]:
+        task = disposal.last()
+        if task is None:
+            raise HTTPException(status_code=404, detail="还没有处置任务")
+        return task.snapshot()
+
+    @app.post("/api/restore")
+    def restore_start(payload: RestorePayload) -> dict[str, object]:
+        mode = payload.onConflict.lower()
+        if mode not in CONFLICT_MODES:
+            raise HTTPException(status_code=400, detail=f"--on-conflict 必须是 {', '.join(CONFLICT_MODES)} 之一")
+        try:
+            target = validate_trash_path(payload.trash)
+        except RestoreError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not os.path.exists(target):
+            raise HTTPException(status_code=404, detail=f"隔离区不存在: {target}")
+        try:
+            task = disposal.start_restore(target, RestoreOptions(dry_run=payload.dryRun, on_conflict=mode))
+        except TrashBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return task.snapshot()
+
+    @app.post("/api/empty")
+    def empty_start(payload: EmptyPayload) -> dict[str, object]:
+        try:
+            target = validate_trash_path(payload.trash)
+        except RestoreError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not os.path.isdir(target):
+            raise HTTPException(status_code=404, detail=f"隔离区不存在: {target}")
+        # 清空是不可逆操作，必须显式确认
+        if not payload.confirm:
+            raise HTTPException(status_code=409, detail="清空隔离区不可恢复，需要确认后再执行")
+        try:
+            task = disposal.start_empty(
+                target, EmptyOptions(dry_run=False, keep_manifests=not payload.purgeManifests)
+            )
+        except TrashBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return task.snapshot()
+
+    @app.get("/api/config")
+    def read_config() -> dict[str, object]:
+        """暴露当前工作目录的配置摘要，让前端能提示「哪些目录会被跳过」。"""
+        try:
+            config = load_config(None)
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "source": str(config.source) if config.source else None,
+            "anyLevelDirs": list(config.any_level_dirs),
+            "systemDirs": list(config.system_dirs),
+            "excludeExtensions": list(config.exclude_extensions),
+        }
 
     return app

@@ -17,6 +17,8 @@ FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 FILE_SHARE_DELETE = 0x00000004
 OPEN_EXISTING = 3
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 MOVEFILE_REPLACE_EXISTING = 0x00000001
 MOVEFILE_COPY_ALLOWED = 0x00000002
@@ -65,6 +67,10 @@ _CloseHandle.restype = wintypes.BOOL
 _MoveFileExW = _kernel32.MoveFileExW
 _MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
 _MoveFileExW.restype = wintypes.BOOL
+
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+OPEN_ALWAYS = 4
+ERROR_SHARING_VIOLATION = 32
 
 
 def long_path(path: str) -> str:
@@ -131,6 +137,32 @@ def move_file(src: str, dst: str) -> bool:
 
 def is_reparse_point(attributes: int) -> bool:
     return bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def open_exclusive(path: str) -> int:
+    """以独占方式打开/创建文件，返回句柄；被占用时抛 ``OSError``。
+
+    ``dwShareMode=0`` 意味着在这个句柄关闭前，任何其它进程（包括命令行）
+    都无法打开它 —— 这正是跨进程互斥要的语义。``os.open`` 没有这个能力，
+    它总是允许共享读写。
+    """
+    handle = _CreateFileW(
+        long_path(path),
+        GENERIC_READ | GENERIC_WRITE,
+        0,  # 不共享：别人打开就会失败
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE or handle is None:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"无法独占打开 {path}")
+    return int(handle)
+
+
+def close_handle(handle: int) -> None:
+    _CloseHandle(handle)
 
 
 def scandir(path: str) -> list[os.DirEntry]:

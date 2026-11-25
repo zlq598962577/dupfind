@@ -13,11 +13,11 @@
       <span class="logo" aria-hidden="true">d</span>
       <div class="brand-text">
         <h1>dupfind</h1>
-        <p>本地重复文件可视化 · v1 只读</p>
+        <p>本地重复文件清理 · 先看清楚，再动手</p>
       </div>
     </div>
     <div class="topbar-actions">
-      <span class="pill" id="serverPill">本地 · 只读</span>
+      <span class="pill" id="serverPill">本地</span>
       <button class="ghost-btn" id="themeToggle" type="button" aria-label="切换深色模式">
         <span id="themeIcon">◐</span><span id="themeLabel">深色</span>
       </button>
@@ -57,7 +57,7 @@
       <section class="card">
         <div class="card-head">
           <h2>扫描</h2>
-          <span class="hint" id="scanHint">只读遍历，不会移动或删除文件</span>
+          <span class="hint" id="scanHint">扫描只读；处置在勾选后单独确认</span>
         </div>
         <form id="scanForm" class="form">
           <div class="field">
@@ -155,6 +155,11 @@
         </label>
         <span class="result-count" id="resultCount">0 组</span>
       </div>
+      <div class="toolbar-row third">
+        <button class="secondary-btn small" id="selectPageBtn" type="button">选中本页可处置组</button>
+        <button class="ghost-btn small" id="clearSelectionBtn" type="button">清除选择</button>
+        <span class="hint" id="selectionHint">硬链接组、疑似组与受保护路径不可勾选</span>
+      </div>
     </section>
 
     <section class="groups" id="groupList" aria-live="polite"></section>
@@ -168,9 +173,55 @@
     </div>
   </main>
 
+  <!-- 处置操作栏：有勾选时才出现 -->
+  <div class="actionbar" id="actionBar" hidden>
+    <div class="actionbar-inner">
+      <div class="actionbar-summary">
+        <strong id="actionGroups">已选 0 组</strong>
+        <span id="actionDetail">将移动 0 个文件 · 释放 0 B</span>
+      </div>
+      <div class="actionbar-buttons">
+        <button class="ghost-btn" id="actionCancelBtn" type="button">取消</button>
+        <button class="primary-btn" id="actionPreviewBtn" type="button">预览并处置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 预览 / 确认对话框 -->
+  <div class="modal" id="modal" hidden>
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <h2 id="modalTitle">确认处置</h2>
+        <button class="ghost-btn small" id="modalCloseBtn" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-foot" id="modalFoot"></div>
+    </div>
+  </div>
+
+  <!-- 处置进度 -->
+  <div class="modal" id="progressModal" hidden>
+    <div class="modal-backdrop"></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="progressTitle">
+      <div class="modal-head">
+        <h2 id="progressTitle">处置中</h2>
+      </div>
+      <div class="modal-body">
+        <div class="progress-head">
+          <span class="progress-phase" id="disposalPhase">准备中</span>
+          <span class="progress-ratio" id="disposalDetail">0 / 0 组</span>
+        </div>
+        <div class="progress-bar" id="disposalBar"><span></span></div>
+        <div class="progress-stats" id="disposalStats"></div>
+      </div>
+      <div class="modal-foot" id="progressFoot"></div>
+    </div>
+  </div>
+
   <footer class="footer">
-    <span>dupfind web v1 · 只读</span>
-    <span>扫描与浏览均在本地完成，不联网</span>
+    <span>dupfind web</span>
+    <span>扫描、处置与还原均在本地完成，不联网</span>
   </footer>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>

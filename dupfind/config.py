@@ -37,6 +37,9 @@ ANY_LEVEL_DIRS: tuple[str, ...] = (
     # dupfind 自己的隔离区绝不能参与扫描：否则「活副本」和「隔离区里的副本」
     # 会被当成一组，--keep 可能选中隔离区那份，随后 empty 把两份一起删掉。
     "_dupfind_trash",
+    # Web 扫描产出的报告目录同理：报告 JSON 是工具自己的产物，不该被当成
+    # 待去重的用户数据（两份报告内容一致时还会被报成一组重复文件）。
+    "dupfind-reports",
 )
 
 EXCLUDE_EXTENSIONS: tuple[str, ...] = (
