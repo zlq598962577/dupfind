@@ -11,3 +11,4 @@ dist/
 dupfind-reports/
 dupfind.toml
 .screenshots/
+dupfind-report.json

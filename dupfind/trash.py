@@ -10,6 +10,7 @@ from datetime import datetime
 
 from .jsonio import write_json_atomic
 from .units import iso_now
+from .win32 import long_path
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
 MANIFEST_VERSION = 1
@@ -88,7 +89,10 @@ class TrashManager:
         base = ntpath.join(self._trash, letter, relative)
         candidate = base
         counter = 1
-        while _normcase(candidate) in self._reserved or os.path.exists(candidate):
+        # 必须用 long_path 探测：镜像目标很容易超过 260 字符，普通 os.path.exists
+        # 在长路径上恒为 False，于是不追加后缀、直接复用已占用的路径 —— 后续
+        # move_file 带 REPLACE_EXISTING 会把隔离区里的旧文件覆盖掉。
+        while _normcase(candidate) in self._reserved or os.path.exists(long_path(candidate)):
             stem, extension = ntpath.splitext(base)
             candidate = f"{stem}.dupfind-{counter}{extension}"
             counter += 1

@@ -13,7 +13,8 @@ from .grouping import build_candidate_groups, content_only_groups
 from .models import FileEntry, GroupRecord, ScanStats
 from .normalize import FilenameNormalizer
 from .scanner import Scanner
-from .verify import Verifier
+from .verify import Verifier, compute_savings
+from .win32 import allocated_size, file_identity
 
 
 @dataclass(slots=True)
@@ -65,10 +66,23 @@ def run_scan(options: ScanOptions) -> PipelineResult:
 
 
 def _suspect_group(files: list[FileEntry]) -> GroupRecord:
-    savings = 0
-    if len(files) > 1:
-        savings = sum(entry.size for entry in files) - max(entry.size for entry in files)
-    return GroupRecord(id=0, status="suspect", size=files[0].size, savings_bytes=savings, files=list(files))
+    """扫描被中断时的兜底分组。
+
+    仍然要填 ``allocated`` 与 ``file_id``：否则硬链接会被当成独立副本、稀疏
+    文件按逻辑大小计，报告里的可节省空间就是错的（规格 6.2）。
+    """
+    for entry in files:
+        entry.allocated = allocated_size(entry.path)
+        if entry.allocated is None:
+            entry.allocated = entry.size
+        entry.file_id = file_identity(entry.path)
+    return GroupRecord(
+        id=0,
+        status="suspect",
+        size=files[0].size,
+        savings_bytes=compute_savings(files),
+        files=list(files),
+    )
 
 
 class _Run:

@@ -24,9 +24,37 @@ def _norm(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
+def canonical(path: str) -> str:
+    """把路径规约成可比较的形式，用于安全判定。
+
+    Windows 上同一个目录有多种写法，直接比字符串会被绕过：
+
+    * ``C:\\Windows ``（尾随空格）—— 系统会静默剥掉尾随空格；
+    * ``C:\\PROGRA~1`` —— 8.3 短名，指向 ``C:\\Program Files``；
+    * ``\\\\?\\C:\\Windows`` —— 扩展长度前缀。
+
+    :func:`os.path.realpath` 在 Windows 上会解析 8.3 短名并规范化分隔符，
+    因此先剥前缀、再做 realpath，最后统一大小写。
+    """
+    text = str(path).strip()
+    # 剥掉扩展长度前缀，否则 realpath 会把它当成相对路径
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[len("\\\\?\\UNC\\") :]
+    elif text.startswith("\\\\?\\"):
+        text = text[len("\\\\?\\") :]
+    try:
+        resolved = os.path.realpath(text)
+    except (OSError, ValueError):
+        resolved = os.path.abspath(text)
+    return os.path.normcase(os.path.normpath(resolved))
+
+
 def protected_reason(path: str) -> str | None:
-    """若路径位于系统保护范围（盘符根目录的系统目录 / 系统根文件）则返回原因。"""
-    drive, rest = ntpath.splitdrive(_norm(path))
+    """若路径位于系统保护范围（盘符根目录的系统目录 / 系统根文件）则返回原因。
+
+    判定基于 :func:`canonical`，因此尾随空格、8.3 短名、扩展长度前缀都绕不过去。
+    """
+    drive, rest = ntpath.splitdrive(canonical(path))
     if not drive:
         return "不是本地绝对路径"
     parts = [part for part in rest.split(ntpath.sep) if part]

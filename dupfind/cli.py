@@ -18,6 +18,14 @@ from .config import Config, ConfigError, load_config, resolve_config_path
 from .models import GroupRecord, ScanStats
 from .pipeline import ScanOptions, run_scan
 from .report import REPORT_VERSION, ReportError, build_report, load_report, write_report
+from .restore import (
+    CONFLICT_MODES,
+    EmptyOptions,
+    RestoreError,
+    RestoreOptions,
+    run_empty,
+    run_restore,
+)
 from .units import format_size, parse_size
 from .verify import hash_algorithm
 
@@ -248,6 +256,54 @@ def _default_trash(root: str) -> str:
     if not drive or not drive.endswith(":"):
         _fail(f"无法从报告根路径推断盘符: {root}", EXIT_USAGE)
     return ntpath.join(drive + "\\", "_dupfind_trash")
+
+
+@app.command()
+def restore(
+    target: str = typer.Argument(..., help="manifest JSON 或 trash 目录（目录时处理其中全部 manifest）"),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="默认只打印计划动作"),
+    on_conflict: str = typer.Option(
+        "skip", "--on-conflict", help="原位置已有文件时：skip / rename / overwrite"
+    ),
+) -> None:
+    """把隔离区里的文件还原到原位置。"""
+    mode = on_conflict.lower()
+    if mode not in CONFLICT_MODES:
+        _fail(f"--on-conflict 必须是 {', '.join(CONFLICT_MODES)} 之一", EXIT_USAGE)
+    try:
+        code = run_restore(target, RestoreOptions(dry_run=dry_run, on_conflict=mode))
+    except RestoreError as exc:
+        _fail(str(exc), EXIT_REPORT)
+    raise typer.Exit(code)
+
+
+@app.command()
+def empty(
+    trash: str = typer.Argument(..., help="要清空的隔离区目录"),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="默认只列出将删除的文件"),
+    purge_manifests: bool = typer.Option(
+        False, "--purge-manifests", help="连 manifest 一并删除（默认保留，便于追溯）"
+    ),
+    yes: bool = typer.Option(False, "--yes", help="跳过确认提示"),
+) -> None:
+    """清空隔离区，真正释放磁盘空间。"""
+    if not dry_run and not yes:
+        # 这是不可逆操作，必须显式确认
+        try:
+            answer = input(f"将永久删除 {trash} 下的全部文件，不可恢复。输入 DELETE 确认: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            raise typer.Exit(EXIT_USAGE) from None
+        if answer.strip() != "DELETE":
+            print("已取消。")
+            raise typer.Exit(EXIT_USAGE)
+    try:
+        code = run_empty(
+            trash, EmptyOptions(dry_run=dry_run, keep_manifests=not purge_manifests)
+        )
+    except RestoreError as exc:
+        _fail(str(exc), EXIT_USAGE)
+    raise typer.Exit(code)
 
 
 @app.command()

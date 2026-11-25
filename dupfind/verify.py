@@ -205,10 +205,13 @@ class Verifier:
         return records
 
     def _suspect_group(self, files: list[FileEntry]) -> GroupRecord:
+        # 必须同时填 file_id：否则 compute_savings 会把硬链接当成各自独立的
+        # 副本，报告里的 savingsBytes 被算大（规格 6.2：硬链接不占额外空间）。
         for entry in files:
             entry.allocated = allocated_size(entry.path)
             if entry.allocated is None:
                 entry.allocated = entry.size
+            entry.file_id = file_identity(entry.path)
         return GroupRecord(
             id=0,
             status="suspect",
@@ -220,7 +223,7 @@ class Verifier:
     # --- I/O --------------------------------------------------------
 
     def _sample(self, entry: FileEntry) -> str | None:
-        cached = self._cache.lookup(entry.path, entry.size, entry.mtime)
+        cached = self._cache.lookup(entry.path, entry.size, entry.mtime, sample_size=self._sample_size)
         if cached is not None and cached.sample:
             return cached.sample
         try:
@@ -235,7 +238,9 @@ class Verifier:
             return None
         if not _same_snapshot(entry, before) or not _same_snapshot(entry, after):
             entry.unstable = True
-        self._cache.store(entry.path, entry.size, entry.mtime, digest, None, self._algorithm)
+        self._cache.store(
+            entry.path, entry.size, entry.mtime, digest, None, self._algorithm, sample_size=self._sample_size
+        )
         return digest
 
     def _hash_entry(self, entry: FileEntry) -> str | None:

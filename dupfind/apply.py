@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .report import ReportDocument, ReportFile, ReportGroup
-from .safety import DEFAULT_SAMPLE_SIZE, content_matches, protected_reason
+from .safety import DEFAULT_SAMPLE_SIZE, canonical, content_matches, protected_reason
 from .trash import Manifest, TrashError, TrashManager, validate_source_path
 from .units import format_size
 from .win32 import long_path, move_file
@@ -128,7 +128,25 @@ def _is_protected_cluster(cluster: list[ReportFile]) -> bool:
     return any(protected_reason(item.path) is not None for item in cluster)
 
 
-def plan_group(group: ReportGroup, mode: str = "shortest") -> tuple[list[ReportFile], list[list[ReportFile]], str | None]:
+def _is_in_trash(path: str, trash: str | None) -> bool:
+    """文件是否已经躺在隔离区里（按规约后的真实路径判断）。"""
+    if not trash:
+        return False
+    try:
+        return ntpath.commonpath([canonical(path), canonical(trash)]) == canonical(trash)
+    except ValueError:
+        return False
+
+
+def _trash_cluster(cluster: list[ReportFile], trash: str | None) -> bool:
+    return any(_is_in_trash(item.path, trash) for item in cluster)
+
+
+def plan_group(
+    group: ReportGroup,
+    mode: str = "shortest",
+    trash: str | None = None,
+) -> tuple[list[ReportFile], list[list[ReportFile]], str | None]:
     """返回 (保留簇, 待删簇列表, 问题)。
 
     处置以物理簇为单位：保留一簇，其余簇整体移走。
@@ -137,6 +155,9 @@ def plan_group(group: ReportGroup, mode: str = "shortest") -> tuple[list[ReportF
     因此**只要有一簇含受保护路径，就强制保留它**，改删用户目录里的副本。这比
     「命中受保护路径就整组放弃」更符合实际：原件在 Program Files、副本在下载
     目录时，应当清理下载目录那份。
+
+    ``trash`` 给出时，已在隔离区里的簇永不作为保留项：否则「活文件」会被移进
+    隔离区、而保留项本身就在隔离区，用户随后执行 ``empty`` 就把唯一的数据删光。
     """
     clusters = physical_clusters(group)
     if len(clusters) < 2:
@@ -147,7 +168,14 @@ def plan_group(group: ReportGroup, mode: str = "shortest") -> tuple[list[ReportF
     protected = [cluster for cluster in clusters if _is_protected_cluster(cluster)]
     if len(protected) >= 2:
         return [], [], "组内有多份位于受保护目录的数据，无法安全处置"
-    keep = protected[0] if protected else choose_keep_cluster(clusters, mode)
+
+    if protected:
+        keep = protected[0]
+    else:
+        outside = [cluster for cluster in clusters if not _trash_cluster(cluster, trash)]
+        if not outside:
+            return [], [], "组内所有副本都已位于隔离区，无可安全处置的文件"
+        keep = choose_keep_cluster(outside, mode)
     removals = [cluster for cluster in clusters if cluster is not keep]
 
     for cluster in removals:
@@ -294,7 +322,7 @@ def run_apply(
         if group.savings_bytes < options.min_savings:
             stats.refused_groups += 1
             continue
-        keep, removals, problem = plan_group(group)
+        keep, removals, problem = plan_group(group, trash=options.trash_dir)
         if problem is not None:
             stats.refused_groups += 1
             print(f"[跳过组 #{group.id}] {problem}")
@@ -333,7 +361,7 @@ def run_apply(
 
 def _apply_with_strategy(group: ReportGroup, options: ApplyOptions, executor: _Executor) -> None:
     mode = options.keep_mode if options.keep_mode != "ask" else "shortest"
-    keep, removals, problem = plan_group(group, mode)
+    keep, removals, problem = plan_group(group, mode, trash=options.trash_dir)
     if problem is not None:
         print(f"[跳过组 #{group.id}] {problem}")
         return
@@ -455,11 +483,16 @@ def _choose_group_files(
         print(f"[跳过组 #{group.id}] 组内有多份位于受保护目录的数据，无法安全处置")
         return "skip"
 
+    in_trash = [cluster for cluster in clusters if _trash_cluster(cluster, options.trash_dir)]
     print(f"\n组 #{group.id}（保留其中一份物理数据，其余整簇移走）：")
     for index, cluster in enumerate(clusters, start=1):
         head = cluster[0].path
         extra = f"（另有 {len(cluster) - 1} 个硬链接路径）" if len(cluster) > 1 else ""
-        note = "  [受保护，必须保留]" if cluster in protected else ""
+        note = ""
+        if cluster in protected:
+            note = "  [受保护，必须保留]"
+        elif cluster in in_trash:
+            note = "  [已在隔离区，不能作为保留项]"
         print(f"  保留 [{index}] {head}{extra}{note}")
         for item in cluster[1:]:
             print(f"           └ {item.path}")
@@ -477,6 +510,15 @@ def _choose_group_files(
             if protected and keep is not protected[0]:
                 print(f"该选择会把受保护路径移走，已改为保留：{protected[0][0].path}")
                 keep = protected[0]
+            # 同理不能把隔离区里的副本选作保留项，否则活文件会被移进隔离区
+            elif keep in in_trash:
+                outside = [cluster for cluster in clusters if cluster not in in_trash]
+                if not outside:
+                    print(f"[跳过组 #{group.id}] 组内所有副本都已在隔离区，无可安全处置的文件")
+                    return "skip"
+                replacement = choose_keep_cluster(outside, options.keep_mode if options.keep_mode != "ask" else "shortest")
+                print(f"该选择保留的是隔离区里的副本，已改为保留：{replacement[0].path}")
+                keep = replacement
             removals = [cluster for cluster in clusters if cluster is not keep]
             executor.move_clusters(group, keep, removals)
             return "apply"

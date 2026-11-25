@@ -62,8 +62,10 @@ class FilenameNormalizer:
         text = to_halfwidth(text).lower()
         stem = ntpath.splitext(text)[0] if ntpath.splitext(text)[1] else text
         text = stem
-        # 反复剔除后缀标记，处理 "报告 - 副本" / "报告 - 副本(2)" 之类的叠加
-        for _ in range(4):
+        # 反复剔除后缀标记，处理 "报告 - 副本" / "报告 - 副本(2)" 之类的叠加。
+        # 每轮至少剥掉一个标记，因此轮数上限用文本长度即可，不设固定次数
+        # （固定 4 轮会把 9 层叠加的标记留在名字里）。
+        for _ in range(len(text) + 1):
             changed = False
             for pattern in self._patterns:
                 match = pattern.search(text)

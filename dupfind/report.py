@@ -106,6 +106,24 @@ def _require(condition: bool, message: str) -> None:
         raise ReportError(message)
 
 
+def _is_count(value: Any) -> bool:
+    """真正的整数计数；排除 bool（``True`` 是 int 子类）与 float。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_group_id(raw: Any, fallback: int, label: str) -> int:
+    """组 id 必须是整数；``"abc"`` / ``None`` / ``NaN`` 都要转成 ReportError。
+
+    直接 ``int(...)`` 会抛 ValueError/TypeError 冒到 CLI 之外，退出码变成 1
+    并打印 traceback，而报告格式错误的约定退出码是 3。
+    """
+    if raw is None:
+        return fallback
+    if _is_count(raw):
+        return raw
+    raise ReportError(f"{label} 非法: {raw!r}")
+
+
 def load_report(path: str | Path) -> ReportDocument:
     report_path = Path(path)
     try:
@@ -117,13 +135,20 @@ def load_report(path: str | Path) -> ReportDocument:
 
     _require(isinstance(raw, dict), "报告根节点必须是对象")
     version = raw.get("version")
-    _require(version == REPORT_VERSION, f"报告版本不匹配（期望 {REPORT_VERSION}，实际 {version!r}）")
+    # 必须是真正的整数：True == 1、1.0 == 1，用 == 比较会放过这两种写法
+    _require(
+        _is_count(version) and version == REPORT_VERSION,
+        f"报告版本不匹配（期望 {REPORT_VERSION}，实际 {version!r}）",
+    )
 
     scan = raw.get("scan")
     _require(isinstance(scan, dict), "缺少 scan 字段")
     root = scan.get("root")
     _require(isinstance(root, str) and root, "scan.root 必须是非空字符串")
-    partial = bool(scan.get("partial", False))
+    # 必须是 JSON 布尔：字符串 "false" 会被 bool() 变成 True，把合法报告误判为 partial
+    raw_partial = scan.get("partial", False)
+    _require(isinstance(raw_partial, bool), f"scan.partial 必须是布尔值: {raw_partial!r}")
+    partial = raw_partial
 
     groups_raw = raw.get("groups")
     _require(isinstance(groups_raw, list), "groups 必须是数组")
@@ -134,9 +159,9 @@ def load_report(path: str | Path) -> ReportDocument:
         status = item.get("status")
         _require(status in VALID_STATUSES, f"groups[{index}].status 非法: {status!r}")
         size = item.get("size")
-        _require(isinstance(size, int) and size >= 0, f"groups[{index}].size 非法")
+        _require(_is_count(size) and size >= 0, f"groups[{index}].size 非法")
         savings = item.get("savingsBytes", 0)
-        _require(isinstance(savings, int) and savings >= 0, f"groups[{index}].savingsBytes 非法")
+        _require(_is_count(savings) and savings >= 0, f"groups[{index}].savingsBytes 非法")
         files_raw = item.get("files")
         _require(isinstance(files_raw, list) and files_raw, f"groups[{index}].files 必须是非空数组")
         files: list[ReportFile] = []
@@ -163,7 +188,7 @@ def load_report(path: str | Path) -> ReportDocument:
             )
         groups.append(
             ReportGroup(
-                id=int(item.get("id", index + 1)),
+                id=_parse_group_id(item.get("id"), index + 1, f"groups[{index}].id"),
                 status=str(status),
                 size=size,
                 savings_bytes=savings,

@@ -90,7 +90,7 @@ def _group_bucket(bucket: list[FileEntry], normalizer: FilenameNormalizer) -> li
     components: dict[int, list[int]] = defaultdict(list)
     for position in range(len(token_sets)):
         components[union_find.find(position)].append(position)
-    return _components_to_groups(token_sets, set_to_files, components, bucket)
+    return _components_to_groups(token_sets, set_to_files, components, bucket, normalizer)
 
 
 def _components_to_groups(
@@ -98,9 +98,18 @@ def _components_to_groups(
     set_to_files: dict[frozenset[str], list[int]],
     components: dict[int, list[int]],
     bucket: list[FileEntry],
+    normalizer: FilenameNormalizer,
 ) -> list[list[FileEntry]]:
     groups: list[list[FileEntry]] = []
     for component in components.values():
+        # 只有一个词元集合的分量意味着「名字归一化后完全相同」，没有走过
+        # is_contained —— 必须补一次短名校验，否则 `x 2.txt`/`x 3.txt`
+        # （都归一化为 `x`）这类噪声名会直接成为候选组，绕过规格 4.3。
+        if len(component) == 1:
+            tokens = token_sets[component[0]]
+            sample_name = bucket[set_to_files[tokens][0]].normalized_name
+            if not normalizer.is_valid_short_name(sample_name, tokens):
+                continue
         members: list[FileEntry] = []
         for position in component:
             members.extend(bucket[index] for index in set_to_files[token_sets[position]])

@@ -34,6 +34,9 @@ ANY_LEVEL_DIRS: tuple[str, ...] = (
     ".m2",
     "Docker",
     "DockerDesktopWSL",
+    # dupfind 自己的隔离区绝不能参与扫描：否则「活副本」和「隔离区里的副本」
+    # 会被当成一组，--keep 可能选中隔离区那份，随后 empty 把两份一起删掉。
+    "_dupfind_trash",
 )
 
 EXCLUDE_EXTENSIONS: tuple[str, ...] = (
@@ -102,6 +105,21 @@ def _as_str_list(value: Any, key: str) -> list[str]:
     raise ConfigError(f"配置项 {key} 必须是字符串数组")
 
 
+def _as_size(value: Any, key: str) -> int:
+    """配置里的大小写成 ``-5`` / ``"abc"`` 时要给出配置错误，而不是崩栈。"""
+    try:
+        return parse_size(str(value))
+    except ValueError as exc:
+        raise ConfigError(f"配置项 {key}: {exc}") from exc
+
+
+def _as_int(value: Any, key: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"配置项 {key} 必须是整数: {value!r}") from exc
+
+
 def load_config(explicit: Path | None = None) -> Config:
     path = explicit
     if path is None:
@@ -141,13 +159,13 @@ def load_config(explicit: Path | None = None) -> Config:
     if "copyMarkers" in files:
         config.copy_markers = _as_str_list(files["copyMarkers"], "files.copyMarkers")
     if "minSize" in scan:
-        config.min_size = parse_size(str(scan["minSize"]))
+        config.min_size = _as_size(scan["minSize"], "scan.minSize")
     if "sampleSize" in scan:
-        config.sample_size = parse_size(str(scan["sampleSize"]))
+        config.sample_size = _as_size(scan["sampleSize"], "scan.sampleSize")
     if "threads" in scan:
-        config.threads = int(scan["threads"])
+        config.threads = _as_int(scan["threads"], "scan.threads")
     if "page" in apply_cfg:
-        config.page_size = int(apply_cfg["page"])
+        config.page_size = _as_int(apply_cfg["page"], "apply.page")
     if "keep" in apply_cfg:
         config.keep_mode = str(apply_cfg["keep"])
 

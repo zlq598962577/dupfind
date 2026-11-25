@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from fixture_builder import DEFAULT_SIZE, content_bytes, make_copy_pair, snapshot, write_file
+from fixture_builder import DEFAULT_SIZE, make_copy_pair, snapshot, write_file
 from harness import (
     COMMIT_FLAGS,
     apply_report,
@@ -18,7 +18,6 @@ from harness import (
     load_report,
     manifest_covers,
     scan,
-    win_norm,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="dupfind 仅支持 Windows")

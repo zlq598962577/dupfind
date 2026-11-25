@@ -20,7 +20,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
+from collections.abc import Iterator
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 
