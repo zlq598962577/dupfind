@@ -10,5 +10,7 @@ dist/
 .dupfind-cache
 dupfind-reports/
 dupfind.toml
+dupfind-ignore.json
+*.state.json
 .screenshots/
 dupfind-report.json

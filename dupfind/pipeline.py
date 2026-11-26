@@ -42,6 +42,8 @@ class ScanOptions:
     threads: int
     max_depth: int | None = None
     exclude_add: list[str] = field(default_factory=list)
+    #: 用户忽略清单里的目录（子树跳过）；``no_exclude`` 时一并失效
+    ignore_dirs: list[str] = field(default_factory=list)
     no_exclude: bool = False
     no_hash: bool = False
     content_only: bool = False
@@ -120,6 +122,7 @@ class _Run:
             options.root,
             extra_globs=options.exclude_add,
             enabled=not options.no_exclude,
+            ignore_dirs=options.ignore_dirs,
         )
         scanner = Scanner(
             options.root,

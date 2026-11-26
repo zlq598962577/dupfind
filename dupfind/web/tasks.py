@@ -143,6 +143,7 @@ class ScanTaskManager:
         no_hash: bool,
         content_only: bool,
         max_depth: int | None,
+        ignore_dirs: list[str] | tuple[str, ...] = (),
     ) -> ScanTask:
         task_id = str(uuid.uuid4())
         report_path = self.report_dir / f"scan-{time.strftime('%Y%m%d-%H%M%S')}-{task_id[:8]}.json"
@@ -158,7 +159,12 @@ class ScanTaskManager:
         with self._lock:
             self._prune()
             self._tasks[task_id] = task
-        thread = threading.Thread(target=self._run, args=(task,), name=f"dupfind-scan-{task_id[:8]}", daemon=True)
+        thread = threading.Thread(
+            target=self._run,
+            args=(task, tuple(ignore_dirs)),
+            name=f"dupfind-scan-{task_id[:8]}",
+            daemon=True,
+        )
         thread.start()
         return task
 
@@ -172,7 +178,7 @@ class ScanTaskManager:
         task.cancel_event.set()
         return True
 
-    def _run(self, task: ScanTask) -> None:
+    def _run(self, task: ScanTask, ignore_dirs: tuple[str, ...] = ()) -> None:
         try:
             self.report_dir.mkdir(parents=True, exist_ok=True)
             options = ScanOptions(
@@ -184,6 +190,7 @@ class ScanTaskManager:
                 max_depth=task.max_depth,
                 no_hash=task.no_hash,
                 content_only=task.content_only,
+                ignore_dirs=list(ignore_dirs),
                 cache_path=self._cache_path,
                 on_progress=task.apply_progress,
                 should_stop=task.cancel_event.is_set,

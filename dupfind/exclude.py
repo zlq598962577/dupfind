@@ -5,8 +5,10 @@ from __future__ import annotations
 import fnmatch
 import ntpath
 import os
+from pathlib import Path
 
 from .config import Config
+from .ignore import IgnoreList
 from .models import FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM
 
 
@@ -25,9 +27,17 @@ class Excluder:
         "_extensions",
         "_root_files",
         "_globs",
+        "_ignore",
     )
 
-    def __init__(self, config: Config, root: str, extra_globs: list[str] | tuple[str, ...] = (), enabled: bool = True) -> None:
+    def __init__(
+        self,
+        config: Config,
+        root: str,
+        extra_globs: list[str] | tuple[str, ...] = (),
+        enabled: bool = True,
+        ignore_dirs: list[str] | tuple[str, ...] = (),
+    ) -> None:
         self._enabled = enabled
         drive, _ = ntpath.splitdrive(ntpath.abspath(root))
         self._drive_root = drive + "\\" if drive else ""
@@ -36,6 +46,9 @@ class Excluder:
         self._extensions = {ext.lower() for ext in config.exclude_extensions}
         self._root_files = {name.lower() for name in config.root_files}
         self._globs = [pattern for pattern in (*config.globs, *extra_globs) if pattern]
+        self._ignore = (
+            IgnoreList(Path("dupfind-ignore.json"), list(ignore_dirs)) if ignore_dirs else None
+        )
 
     def _matches_glob(self, path: str, name: str) -> str | None:
         normalized_path = _norm(path)
@@ -58,6 +71,8 @@ class Excluder:
         pattern = self._matches_glob(path, name)
         if pattern is not None:
             return f"自定义规则({pattern})"
+        if self._ignore is not None and self._ignore.contains(path):
+            return f"忽略目录({name})"
         return None
 
     def file_reason(self, path: str, name: str, attributes: int, depth: int) -> str | None:
@@ -73,4 +88,8 @@ class Excluder:
         pattern = self._matches_glob(path, name)
         if pattern is not None:
             return f"自定义规则({pattern})"
+        # 忽略清单是子树语义：忽略扫描根治下时，根目录下的直接文件也必须
+        # 跳过（子目录由 dir_reason 拦截，根下文件只能在这里拦）
+        if self._ignore is not None and self._ignore.contains(path):
+            return f"忽略目录({ntpath.dirname(path)})"
         return None

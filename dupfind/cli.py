@@ -15,9 +15,11 @@ import typer
 from . import __version__
 from .apply import KEEP_MODES, ApplyOptions, ExecutionError, run_apply
 from .config import Config, ConfigError, load_config, resolve_config_path
+from .ignore import IgnoreError, IgnoreList
 from .models import GroupRecord, ScanStats
 from .pipeline import ScanOptions, run_scan
 from .report import REPORT_VERSION, ReportError, build_report, load_report, write_report
+from .report_state import load_effective_state
 from .restore import (
     CONFLICT_MODES,
     EmptyOptions,
@@ -26,6 +28,7 @@ from .restore import (
     run_empty,
     run_restore,
 )
+from .trash import TrashBusy, TrashLock
 from .units import format_size, parse_size
 from .verify import hash_algorithm
 
@@ -58,6 +61,18 @@ def _resolve_size(value: str | None, fallback: int, label: str) -> int:
         return parse_size(value)
     except ValueError as exc:
         _fail(f"{label}: {exc}", EXIT_USAGE)
+
+
+def _load_ignore(path: str) -> IgnoreList:
+    """读取目录忽略清单；默认工作目录的 dupfind-ignore.json（不存在则空）。
+
+    显式 ``--ignore-file`` 指向不存在的文件时直接报错：静默退回空清单会让
+    用户以为忽略规则已生效，随后把本想忽略的目录也纳入处置。
+    """
+    try:
+        return IgnoreList.load(resolve_config_path(path or None), required=bool(path))
+    except IgnoreError as exc:
+        _fail(str(exc), EXIT_USAGE)
 
 
 def _local_root(root: str) -> str:
@@ -107,6 +122,10 @@ def scan(
     max_depth: int | None = typer.Option(None, "--max-depth", help="递归深度，默认不限"),
     exclude_add: list[str] = typer.Option([], "--exclude-add", help="追加排除 glob，可多次"),
     no_exclude: bool = typer.Option(False, "--no-exclude", help="关闭全部排除规则"),
+    ignore_file: str = typer.Option(
+        "", "--ignore-file", help="目录忽略清单路径，默认工作目录 dupfind-ignore.json"
+    ),
+    no_ignore: bool = typer.Option(False, "--no-ignore", help="本次不应用目录忽略清单"),
     show_excluded: bool = typer.Option(False, "--show-excluded", help="逐条打印被跳过的路径"),
     sample_size: str | None = typer.Option(None, "--sample-size", help="头尾采样大小，默认 4KB"),
     no_hash: bool = typer.Option(False, "--no-hash", help="只做名字+大小筛选，结论为 suspect"),
@@ -137,6 +156,7 @@ def scan(
         if show_excluded or exclude_dry_run:
             print(f"[跳过:{reason}] {path}", file=sys.stderr)
 
+    ignore_dirs = [] if no_ignore else _load_ignore(ignore_file).directories
     excluder_options = ScanOptions(
         root=root_abs,
         config=settings,
@@ -145,6 +165,7 @@ def scan(
         threads=resolved_threads,
         max_depth=max_depth,
         exclude_add=list(exclude_add),
+        ignore_dirs=ignore_dirs,
         no_exclude=no_exclude,
         no_hash=no_hash,
         content_only=content_only,
@@ -217,6 +238,13 @@ def apply(
     no_verify: bool = typer.Option(
         False, "--no-verify-content", help="跳过移动前的内容复核（默认会比对头尾采样）"
     ),
+    ignore_file: str = typer.Option(
+        "", "--ignore-file", help="目录忽略清单路径，默认工作目录 dupfind-ignore.json"
+    ),
+    no_ignore: bool = typer.Option(False, "--no-ignore", help="本次不应用目录忽略清单"),
+    no_state: bool = typer.Option(
+        False, "--no-state", help="不跳过已处置/已忽略的组（状态文件与磁盘不一致时用）"
+    ),
     config: str = typer.Option("", "--config", help="配置文件路径"),
 ) -> None:
     """基于报告批量交互式处置重复文件。"""
@@ -235,6 +263,13 @@ def apply(
     resolved_min_savings = _resolve_size(min_savings, 0, "--min-savings")
 
     resolved_trash = trash or _default_trash(document.root)
+    ignore_list = None if no_ignore else _load_ignore(ignore_file)
+    skip_group_ids: frozenset[int] = frozenset()
+    if not no_state:
+        try:
+            skip_group_ids = load_effective_state(document, trash=resolved_trash).skip_ids()
+        except OSError:
+            skip_group_ids = frozenset()
     options = ApplyOptions(
         trash_dir=resolved_trash,
         page_size=resolved_page,
@@ -243,12 +278,28 @@ def apply(
         assume_yes=yes,
         min_savings=resolved_min_savings,
         verify_content=not no_verify,
+        ignore=ignore_list,
+        skip_group_ids=skip_group_ids,
     )
     try:
-        code = run_apply(document, options)
+        if dry_run:
+            code = run_apply(document, options)
+        else:
+            # 与 Web 处置共用同一把跨进程锁：否则 Web 正在往隔离区移动文件时，
+            # CLI 的 empty 会把它们直接删掉，manifest 却还记着 completed
+            with TrashLock(_lock_target(resolved_trash)):
+                code = run_apply(document, options)
+    except TrashBusy as exc:
+        _fail(str(exc), EXIT_USAGE)
     except ExecutionError as exc:
         _fail(str(exc), EXIT_REPORT)
     raise typer.Exit(code)
+
+
+def _lock_target(path: str) -> str:
+    """锁文件操作的隔离区目录：manifest 文件取父目录，其余取自身（绝对化）。"""
+    text = os.path.abspath(str(path))
+    return text if os.path.isdir(text) else ntpath.dirname(text)
 
 
 def _default_trash(root: str) -> str:
@@ -271,7 +322,13 @@ def restore(
     if mode not in CONFLICT_MODES:
         _fail(f"--on-conflict 必须是 {', '.join(CONFLICT_MODES)} 之一", EXIT_USAGE)
     try:
-        code = run_restore(target, RestoreOptions(dry_run=dry_run, on_conflict=mode))
+        if dry_run:
+            code = run_restore(target, RestoreOptions(dry_run=dry_run, on_conflict=mode))
+        else:
+            with TrashLock(_lock_target(target)):
+                code = run_restore(target, RestoreOptions(dry_run=dry_run, on_conflict=mode))
+    except TrashBusy as exc:
+        _fail(str(exc), EXIT_USAGE)
     except RestoreError as exc:
         _fail(str(exc), EXIT_REPORT)
     raise typer.Exit(code)
@@ -298,9 +355,19 @@ def empty(
             print("已取消。")
             raise typer.Exit(EXIT_USAGE)
     try:
-        code = run_empty(
-            trash, EmptyOptions(dry_run=dry_run, keep_manifests=not purge_manifests)
-        )
+        if dry_run:
+            code = run_empty(
+                trash, EmptyOptions(dry_run=dry_run, keep_manifests=not purge_manifests)
+            )
+        else:
+            # 与 apply/restore 共用锁：Web 任务还在往隔离区移动文件时，
+            # 这里删掉的正是它 manifest 里登记的唯一副本
+            with TrashLock(_lock_target(trash)):
+                code = run_empty(
+                    trash, EmptyOptions(dry_run=dry_run, keep_manifests=not purge_manifests)
+                )
+    except TrashBusy as exc:
+        _fail(str(exc), EXIT_USAGE)
     except RestoreError as exc:
         _fail(str(exc), EXIT_USAGE)
     raise typer.Exit(code)

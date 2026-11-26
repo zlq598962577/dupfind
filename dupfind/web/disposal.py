@@ -24,17 +24,19 @@ from typing import Any
 from ..apply import ApplyOptions, ApplyStats, DisposalPlan, ExecutionError, build_plan, execute_plan
 from ..console import capture
 from ..report import ReportDocument
+from ..report_state import record_apply_result
 from ..restore import EmptyOptions, RestoreError, RestoreOptions, run_empty, run_restore
-from ..trash import TrashError
+from ..trash import TrashBusy, TrashError, TrashLock
 from ..units import format_size
-from ..win32 import close_handle, open_exclusive
+from ..win32 import long_path
 
 MAX_TASKS = 20
-#: 隔离区锁文件的后缀，放在隔离区**外面**：放进隔离区会被 empty 当成 payload 删掉
-TRASH_LOCK_SUFFIX = ".lock"
 # 超过这个规模的处置要求前端输入 DELETE 二次确认（与 CLI 的 empty 一致）
 CONFIRM_THRESHOLD_FILES = 20
 CONFIRM_THRESHOLD_BYTES = 1 << 30
+#: 一次处置超过这么多组，同样要求输入 DELETE：单看文件数会漏掉「全是小组」
+#: 但涉及上千个目录、几乎无法人工复核的批量操作。
+CONFIRM_THRESHOLD_GROUPS = 100
 
 
 @dataclass(slots=True)
@@ -53,6 +55,9 @@ class PreviewPayload:
     freedBytes: int
     freedText: str
     requiresConfirmation: bool
+    skippedByReason: list[dict[str, Any]]
+    missingFiles: int
+    estimatedSeconds: int
     byDirectory: list[dict[str, Any]]
     byExtension: list[dict[str, Any]]
     skipped: list[dict[str, Any]]
@@ -67,6 +72,9 @@ class PreviewPayload:
             "freedBytes": self.freedBytes,
             "freedText": self.freedText,
             "requiresConfirmation": self.requiresConfirmation,
+            "skippedByReason": self.skippedByReason,
+            "missingFiles": self.missingFiles,
+            "estimatedSeconds": self.estimatedSeconds,
             "byDirectory": self.byDirectory,
             "byExtension": self.byExtension,
             "skipped": self.skipped,
@@ -74,6 +82,37 @@ class PreviewPayload:
             "trash": self.trash,
             "dryRun": self.dryRun,
         }
+
+
+#: 内容复核的粗略耗时（5400rpm HDD 串行实测约 78ms/文件）。只用于给用户一个
+#: 量级，不能当作承诺：SSD 上会快一个数量级，网络盘上会更慢。
+SECONDS_PER_FILE_VERIFY = 0.078
+SECONDS_PER_FILE_MOVE = 0.012
+
+
+def _missing_files(plan: DisposalPlan) -> int:
+    """快速检查待移动文件是否仍然存在（目录级 scandir，避免逐文件 stat）。"""
+    directory_cache: dict[str, set[str]] = {}
+    missing = 0
+    for planned in plan.groups:
+        for cluster in planned.removals:
+            for item in cluster:
+                directory = ntpath.dirname(item.path)
+                key = os.path.normcase(directory)
+                names = directory_cache.get(key)
+                if names is None:
+                    names = set()
+                    try:
+                        with os.scandir(long_path(directory)) as iterator:
+                            for entry in iterator:
+                                names.add(os.path.normcase(entry.name))
+                    except (OSError, ValueError):
+                        # NUL 等非法路径会抛 ValueError；预览不能因此整页 500
+                        names = set()
+                    directory_cache[key] = names
+                if os.path.normcase(ntpath.basename(item.path)) not in names:
+                    missing += 1
+    return missing
 
 
 def _directory_key(path: str, depth: int) -> str:
@@ -133,12 +172,23 @@ def build_preview(
     buckets, extensions, extension_bytes = _aggregate(document, plan)
     file_count = plan.file_count
     freed = plan.freed_bytes
+    reason_counts = Counter(reason for _, reason in plan.skipped)
+    per_file = SECONDS_PER_FILE_MOVE + (SECONDS_PER_FILE_VERIFY if options.verify_content else 0.0)
     return PreviewPayload(
         groupCount=plan.group_count,
         fileCount=file_count,
         freedBytes=freed,
         freedText=format_size(freed),
-        requiresConfirmation=file_count > CONFIRM_THRESHOLD_FILES or freed > CONFIRM_THRESHOLD_BYTES,
+        requiresConfirmation=(
+            file_count > CONFIRM_THRESHOLD_FILES
+            or freed > CONFIRM_THRESHOLD_BYTES
+            or plan.group_count > CONFIRM_THRESHOLD_GROUPS
+        ),
+        skippedByReason=[
+            {"reason": reason, "groups": count} for reason, count in reason_counts.most_common(12)
+        ],
+        missingFiles=_missing_files(plan) if file_count else 0,
+        estimatedSeconds=int(file_count * per_file),
         byDirectory=[
             {"directory": bucket.directory, "files": bucket.files, "bytes": bucket.bytes, "text": format_size(bucket.bytes)}
             for bucket in buckets
@@ -174,6 +224,11 @@ class DisposalTask:
     report_path: str = ""
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    #: 终态时供前端就地更新视图：哪些组已处置 / 部分处置 / 仍未处理
+    handled_group_ids: list[int] = field(default_factory=list)
+    partial_group_ids: list[int] = field(default_factory=list)
+    remaining_group_ids: list[int] = field(default_factory=list)
+    state_written: bool = True
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
@@ -195,67 +250,11 @@ class DisposalTask:
             "trash": self.trash,
             "reportPath": self.report_path,
             "durationMs": int(elapsed * 1000),
+            "handledGroupIds": list(self.handled_group_ids),
+            "partialGroupIds": list(self.partial_group_ids),
+            "remainingGroupIds": list(self.remaining_group_ids),
+            "stateWritten": self.state_written,
         }
-
-
-class TrashBusy(RuntimeError):
-    """同一隔离区已有处置任务在跑。"""
-
-
-def _lock_path(trash: str) -> str:
-    """锁文件放在隔离区的**同级**，不能放进去。
-
-    放进隔离区的话，``empty`` 会把它当 payload 删掉（目录里所有非 manifest
-    文件都会被 unlink），锁就凭空消失，互斥失效。同级文件在 ``empty`` 的
-    遍历范围之外，且随隔离区一起消失（用户删掉隔离区时锁也自然没了）。
-    """
-    parent = ntpath.dirname(ntpath.normpath(trash))
-    name = ntpath.basename(ntpath.normpath(trash))
-    return ntpath.join(parent, f".{name}{TRASH_LOCK_SUFFIX}")
-
-
-class TrashLock:
-    """跨进程的隔离区互斥（独占句柄，进程退出即释放）。
-
-    为什么必须有：apply 把文件移入 ``<盘符>:\\_dupfind_trash`` 的过程中，
-    另一个标签页/第二个 web 实例/CLI 对同一隔离区执行 ``empty``，会把这些
-    刚移入的文件逐个 unlink。apply 的 manifest 仍记为 completed，之后
-    ``restore`` 只会报「缺失」并以成功结束 —— 用户完全察觉不到唯一副本
-    已经被删掉。
-
-    用 ``CreateFileW`` 的独占共享模式实现，而不是内存锁：CLI 和另一个 web
-    实例是不同进程，内存里的 ``threading.Lock`` 管不到它们。
-    """
-
-    __slots__ = ("_handle", "_path")
-
-    def __init__(self, trash: str) -> None:
-        self._path = _lock_path(trash)
-        self._handle: int | None = None
-
-    def acquire(self) -> None:
-        try:
-            os.makedirs(ntpath.dirname(self._path) or ".", exist_ok=True)
-            self._handle = open_exclusive(self._path)
-        except OSError as exc:
-            raise TrashBusy(
-                f"隔离区正被另一个处置任务使用，请等它结束后再试：{ntpath.dirname(self._path)}"
-            ) from exc
-
-    def release(self) -> None:
-        if self._handle is not None:
-            try:
-                close_handle(self._handle)
-            finally:
-                self._handle = None
-
-    def __enter__(self) -> TrashLock:
-        self.acquire()
-        return self
-
-    def __exit__(self, *exc_info: object) -> bool:
-        self.release()
-        return False
 
 
 class DisposalTaskManager:
@@ -267,6 +266,14 @@ class DisposalTaskManager:
 
     def get(self, task_id: str) -> DisposalTask | None:
         return self._tasks.get(task_id)
+
+    def cancel(self, task_id: str) -> bool:
+        """请求停止一个 apply 任务；只在组边界生效（不会把一组拆开）。"""
+        task = self._tasks.get(task_id)
+        if task is None or task.state != "running" or task.kind != "apply":
+            return False
+        task.cancel_event.set()
+        return True
 
     def last(self) -> DisposalTask | None:
         with self._lock:
@@ -375,30 +382,37 @@ class DisposalTaskManager:
         # 这个对象里。拿不到它就会向用户报「移动 0 个」，而文件其实在隔离区，
         # 用户既不知道要还原，也可能直接去清空。
         stats = ApplyStats()
+        plan = None
+        # 终态（succeeded/failed/cancelled）直到 finally 复制完统计后才发布：
+        # 否则轮询可能先看到「成功、移动 0 个」，前端会失去还原入口
+        outcome = "failed"
         try:
             plan = build_plan(document, options, group_ids)
             task.total_groups = plan.group_count
             task.phase = "applying"
             if plan.group_count == 0:
                 task.message = "没有可处置的确认组"
-                task.state = "succeeded"
-                return
-            with capture():
-                execute_plan(
-                    document,
-                    plan,
-                    options,
-                    on_progress=lambda done, total: self._progress(task, done, total),
-                    stats=stats,
-                )
-            task.state = "failed" if stats.failed_files else "succeeded"
-            if stats.failed_files:
-                task.error = f"{stats.failed_files} 个文件移动失败"
+                outcome = "succeeded"
+            else:
+                with capture():
+                    execute_plan(
+                        document,
+                        plan,
+                        options,
+                        on_progress=lambda done, total: self._progress(task, done, total),
+                        stats=stats,
+                        should_stop=task.cancel_event.is_set,
+                    )
+                if stats.cancelled:
+                    outcome = "cancelled"
+                    task.message = f"已停止：完成 {len(stats.processed_group_ids)} / {plan.group_count} 组"
+                elif stats.failed_files:
+                    task.error = f"{stats.failed_files} 个文件移动失败"
+                else:
+                    outcome = "succeeded"
         except (ExecutionError, TrashError, RestoreError, OSError) as exc:
-            task.state = "failed"
             task.error = str(exc)
         except Exception as exc:  # 后台任务必须把错误落到任务状态里
-            task.state = "failed"
             task.error = f"{type(exc).__name__}: {exc}"
         finally:
             # 无论成功失败，都如实报告已经移动了多少 —— 前端据此决定是否
@@ -407,9 +421,30 @@ class DisposalTaskManager:
             task.moved_bytes = stats.moved_bytes
             task.skipped_files = stats.skipped_files
             task.failed_files = stats.failed_files
-            lock.release()
+            task.handled_group_ids = [
+                group_id for group_id, (state, _, _) in stats.group_results.items() if state == "handled"
+            ]
+            task.partial_group_ids = [
+                group_id for group_id, (state, _, _) in stats.group_results.items() if state == "partial"
+            ]
+            if plan is not None:
+                processed = set(stats.processed_group_ids)
+                task.remaining_group_ids = [
+                    item.group_id for item in plan.groups if item.group_id not in processed
+                ]
+            if stats.group_results:
+                try:
+                    if not record_apply_result(document, stats.group_results, manifest=stats.manifest_path):
+                        task.state_written = False
+                except OSError:
+                    task.state_written = False
+                if not task.state_written:
+                    note = "处置状态未能写入；下次加载报告时这些组可能仍显示为待处理"
+                    task.message = f"{task.message}（{note}）" if task.message else note
             task.phase = "done"
             task.finished_at = time.time()
+            task.state = outcome
+            lock.release()
 
     def _progress(self, task: DisposalTask, done: int, total: int) -> None:
         task.processed_groups = done

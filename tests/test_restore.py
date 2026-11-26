@@ -840,3 +840,51 @@ def test_empty_refuses_junction_root(tmp_path):
     with pytest.raises(RestoreError, match="junction"):
         run_empty(str(link), EmptyOptions(dry_run=False))
     assert keep.is_file(), "顺着 junction 删掉了隔离区之外的文件"
+
+
+def test_restore_completed_but_in_place_persists_restored(tmp_path):
+    """completed 的动作文件已在原位（上次还原后没来得及写快照）：必须落盘，
+    否则 manifest 永远停在 completed，状态文件也就永远显示「已处置」。"""
+    from dupfind.restore import RestoreOptions, run_restore
+
+    source = tmp_path / "data" / "a.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(content_bytes(SIZE, seed=31))
+    trash = tmp_path / "trash"
+    manifest_path = _write_manifest(
+        trash,
+        [
+            {
+                "groupId": 1,
+                "src": str(source),
+                "dst": str(trash / "C" / "data" / "a.bin"),
+                "size": SIZE,
+                "status": "completed",
+            }
+        ],
+    )
+
+    code = run_restore(manifest_path, RestoreOptions(dry_run=False))
+    assert code == 0
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert saved["actions"][0]["status"] == "restored"
+
+
+def test_empty_keeps_journal_with_manifests(tmp_path):
+    """keep_manifests 时 journal 必须与快照一起保留：崩溃后 journal 才是最新事实。"""
+    from dupfind.restore import EmptyOptions, run_empty
+
+    trash = tmp_path / "trash"
+    manifest_path = _write_manifest(trash, [])
+    journal = Path(str(manifest_path) + ".journal")
+    journal.write_text("", encoding="utf-8")
+
+    code = run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=True))
+    assert code == 0
+    assert manifest_path.is_file()
+    assert journal.is_file(), "journal 被当成普通文件删掉了"
+
+    code = run_empty(str(trash), EmptyOptions(dry_run=False, keep_manifests=False))
+    assert code == 0
+    assert not manifest_path.exists()
+    assert not journal.exists()

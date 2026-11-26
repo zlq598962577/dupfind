@@ -675,3 +675,17 @@ def test_trash_target_detects_collision_on_long_path(tmp_path):
     second = fresh.target_for(source)
     assert second != target, "长路径下未检测到已存在的目标，会覆盖旧文件"
     assert "dupfind-" in os.path.basename(second)
+
+
+def test_file_reason_respects_ignore_subtree():
+    """忽略「(根目录)」后，根下的直接文件也必须被扫描跳过。
+
+    子目录由 dir_reason 拦截；扫描根本身不会调用 dir_reason，根下文件只能
+    在 file_reason 里拦，否则视图隐藏了它们、重扫却仍会收进报告。
+    """
+    from dupfind.config import Config
+    from dupfind.exclude import Excluder
+
+    excluder = Excluder(Config(), r"D:\data", ignore_dirs=[r"D:\data"])
+    assert excluder.file_reason(r"D:\data\a.jpg", "a.jpg", 0, 0) is not None
+    assert excluder.file_reason(r"D:\other\a.jpg", "a.jpg", 0, 0) is None

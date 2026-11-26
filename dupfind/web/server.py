@@ -14,12 +14,15 @@ from pydantic import BaseModel, Field
 from .. import __version__
 from ..apply import ApplyOptions, ExecutionError
 from ..config import ConfigError, load_config
+from ..ignore import IgnoreError, IgnoreList, default_ignore_path, update_ignore
 from ..report import ReportError, load_report
+from ..report_state import load_effective_state, set_manual_group_state
 from ..restore import CONFLICT_MODES, EmptyOptions, RestoreError, RestoreOptions
 from ..units import parse_size
 from .disposal import (
     CONFIRM_THRESHOLD_BYTES,
     CONFIRM_THRESHOLD_FILES,
+    CONFIRM_THRESHOLD_GROUPS,
     DisposalTaskManager,
     TrashBusy,
     build_preview,
@@ -50,13 +53,13 @@ class PreviewPayload(BaseModel):
     keep: str = "shortest"
     trash: str = ""
     minSavings: str = "0"
+    verifyContent: bool = True
 
 
 class ApplyPayload(PreviewPayload):
     """执行请求：在预览的基础上要求 ``confirm`` 明确确认。"""
 
     confirm: bool = False
-    verifyContent: bool = True
 
 
 class RestorePayload(BaseModel):
@@ -69,6 +72,20 @@ class EmptyPayload(BaseModel):
     trash: str = Field(..., min_length=1)
     purgeManifests: bool = False
     confirm: bool = False
+
+
+class IgnorePayload(BaseModel):
+    """加入忽略清单的目录（子树语义）。"""
+
+    path: str = Field(..., min_length=1)
+
+
+class GroupStatePayload(BaseModel):
+    """手动标记某组为已忽略，或恢复为待处理。"""
+
+    reportPath: str = Field(..., min_length=1)
+    groupId: int
+    state: str = "ignored"
 
 
 def _validate_root(root: str) -> str:
@@ -105,6 +122,7 @@ def _apply_options(payload: PreviewPayload) -> ApplyOptions:
         dry_run=True,
         assume_yes=True,
         min_savings=min_savings,
+        verify_content=payload.verifyContent,
     )
 
 
@@ -119,13 +137,21 @@ def _resolve_trash(payload: PreviewPayload, document) -> str:
 def create_app(
     manager: ScanTaskManager | None = None,
     disposal: DisposalTaskManager | None = None,
+    ignore_path: Path | str | None = None,
 ) -> FastAPI:
     manager = manager or ScanTaskManager(Path.cwd() / "dupfind-reports")
     disposal = disposal or DisposalTaskManager()
     app = FastAPI(title="dupfind web", version=__version__, docs_url=None, redoc_url=None)
     app.state.manager = manager
     app.state.disposal = disposal
+    app.state.ignore_path = Path(ignore_path) if ignore_path is not None else default_ignore_path()
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    def _load_ignore() -> IgnoreList:
+        try:
+            return IgnoreList.load(app.state.ignore_path)
+        except IgnoreError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -140,7 +166,12 @@ def create_app(
             "lastReport": manager.last_report(),
             "defaults": {"minSize": "1KB", "noHash": False, "contentOnly": False},
             "keepModes": list(KEEP_MODES),
-            "confirmThreshold": {"files": CONFIRM_THRESHOLD_FILES, "bytes": CONFIRM_THRESHOLD_BYTES},
+            "confirmThreshold": {
+                "files": CONFIRM_THRESHOLD_FILES,
+                "bytes": CONFIRM_THRESHOLD_BYTES,
+                "groups": CONFIRM_THRESHOLD_GROUPS,
+            },
+            "ignorePath": str(app.state.ignore_path),
             "lastDisposal": disposal.last().snapshot() if disposal.last() else None,
         }
 
@@ -161,6 +192,7 @@ def create_app(
             no_hash=payload.noHash,
             content_only=payload.contentOnly,
             max_depth=payload.maxDepth,
+            ignore_dirs=_load_ignore().directories,
         )
         return task.snapshot()
 
@@ -186,24 +218,39 @@ def create_app(
             document = load_report(report_path)
         except ReportError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return build_view(document)
+        ignore = _load_ignore()
+        state = load_effective_state(document)
+        return build_view(document, ignore=ignore, state=state)
 
     # --- 处置闭环 ---------------------------------------------------
 
-    def _load_for_disposal(payload: PreviewPayload):
-        report_path = _validate_report_path(payload.reportPath)
+    def _load_document(raw: str):
+        report_path = _validate_report_path(raw)
         try:
             document = load_report(report_path)
         except ReportError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return document
 
+    def _prepare_options(payload: PreviewPayload, document) -> ApplyOptions:
+        """统一的处置参数：忽略清单与「已处置组」跳过规则在这里注入。
+
+        预览与执行必须用同一份 options，否则会出现「预览说 100 组、执行说
+        80 组」的偏差。
+        """
+        options = _apply_options(payload)
+        options.trash_dir = _resolve_trash(payload, document)
+        options.ignore = _load_ignore()
+        options.skip_group_ids = load_effective_state(
+            document, trash=options.trash_dir
+        ).skip_ids()
+        return options
+
     @app.post("/api/apply/preview")
     def apply_preview(payload: PreviewPayload) -> dict[str, object]:
         """执行前预览：不写任何文件。"""
-        document = _load_for_disposal(payload)
-        options = _apply_options(payload)
-        options.trash_dir = _resolve_trash(payload, document)
+        document = _load_document(payload.reportPath)
+        options = _prepare_options(payload, document)
         try:
             preview = build_preview(document, options, payload.groupIds)
         except ExecutionError as exc:
@@ -212,9 +259,8 @@ def create_app(
 
     @app.post("/api/apply")
     def apply_start(payload: ApplyPayload) -> dict[str, object]:
-        document = _load_for_disposal(payload)
-        options = _apply_options(payload)
-        options.trash_dir = _resolve_trash(payload, document)
+        document = _load_document(payload.reportPath)
+        options = _prepare_options(payload, document)
         options.verify_content = payload.verifyContent
         options.dry_run = False
 
@@ -242,6 +288,14 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return task.snapshot()
+
+    @app.post("/api/disposal/{task_id}/cancel")
+    def cancel_disposal(task_id: str) -> dict[str, object]:
+        """停止 apply；在下一个组边界生效，不会把一组文件拆成两半。"""
+        task = disposal.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        return {"cancelled": disposal.cancel(task_id), "task": task.snapshot()}
 
     @app.get("/api/disposal")
     def disposal_last() -> dict[str, object]:
@@ -285,6 +339,50 @@ def create_app(
         except TrashBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return task.snapshot()
+
+    # --- 忽略清单与处置状态 -----------------------------------------
+
+    @app.get("/api/ignore")
+    def read_ignore() -> dict[str, object]:
+        return {"path": str(app.state.ignore_path), "directories": _load_ignore().directories}
+
+    @app.post("/api/ignore")
+    def add_ignore(payload: IgnorePayload) -> dict[str, object]:
+        try:
+            ignore = update_ignore(app.state.ignore_path, add=payload.path)
+        except IgnoreError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"path": str(ignore.path), "directories": ignore.directories}
+
+    @app.delete("/api/ignore")
+    def remove_ignore(path: str = Query(..., min_length=1)) -> dict[str, object]:
+        try:
+            ignore = update_ignore(app.state.ignore_path, remove=path)
+        except IgnoreError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"path": str(ignore.path), "directories": ignore.directories}
+
+    @app.post("/api/report/state")
+    def set_group_state(payload: GroupStatePayload) -> dict[str, object]:
+        """手动把一组标为已忽略，或恢复为待处理。"""
+        state = payload.state.strip().lower()
+        if state not in ("ignored", "pending"):
+            raise HTTPException(status_code=400, detail="状态必须是 ignored 或 pending")
+        document = _load_document(payload.reportPath)
+        if not any(group.id == payload.groupId for group in document.groups):
+            raise HTTPException(status_code=404, detail=f"报告中不存在第 {payload.groupId} 组")
+        try:
+            ok = set_manual_group_state(
+                document, payload.groupId, None if state == "pending" else state
+            )
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"无法写入处置状态: {exc}") from exc
+        if not ok:
+            raise HTTPException(
+                status_code=409,
+                detail="报告已被重新扫描，旧状态不再适用；请重新加载报告后再操作",
+            )
+        return {"groupId": payload.groupId, "state": state}
 
     @app.get("/api/config")
     def read_config() -> dict[str, object]:

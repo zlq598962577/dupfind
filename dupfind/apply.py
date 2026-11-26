@@ -13,8 +13,11 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from .console import say
+from .ignore import IgnoreList
 from .report import ReportDocument, ReportFile, ReportGroup
-from .safety import DEFAULT_SAMPLE_SIZE, canonical, content_matches, protected_reason
+from .report_filter import cluster_files, cluster_occupancy, effective_group
+from .report_state import record_apply_result
+from .safety import DEFAULT_SAMPLE_SIZE, CanonicalCache, canonical, content_matches, protected_reason
 from .trash import Manifest, TrashError, TrashManager, validate_source_path
 from .units import format_size
 from .win32 import long_path, move_file
@@ -33,6 +36,10 @@ class ApplyOptions:
     min_savings: int = 0
     verify_content: bool = True
     sample_size: int = DEFAULT_SAMPLE_SIZE
+    #: 用户忽略的目录；其中的文件不参与规划与执行（视图与处置共用同一规则）
+    ignore: IgnoreList | None = None
+    #: 已处置 / 已忽略的组，直接跳过，避免重复扫描已不存在的文件
+    skip_group_ids: frozenset[int] = frozenset()
 
 
 @dataclass(slots=True)
@@ -42,7 +49,18 @@ class ApplyStats:
     moved_bytes: int = 0
     skipped_files: int = 0
     failed_files: int = 0
+    #: 预检时发现已不在原处的文件（多半是之前处置过、重试时又被计划）
+    missing_files: int = 0
     refused_groups: int = 0
+    #: 逐组结果 ``{groupId: (state, moved_files, moved_bytes)}``，state 为
+    #: ``handled``（全部成功）或 ``partial``（有跳过/失败）。供状态文件记录。
+    group_results: dict[int, tuple[str, int, int]] = field(default_factory=dict)
+    #: 已走到收尾的组（含 0 移动），用于计算取消后还剩哪些组
+    processed_group_ids: list[int] = field(default_factory=list)
+    #: 本次写出的 manifest（没有实际移动时为 None）
+    manifest_path: str | None = None
+    #: 用户在组边界处停止
+    cancelled: bool = False
 
 
 @dataclass(slots=True)
@@ -100,12 +118,7 @@ def _identity(file: ReportFile) -> str:
 
 def physical_clusters(group: ReportGroup) -> list[list[ReportFile]]:
     """把组内文件按物理身份聚簇，跳过不稳定文件。"""
-    clusters: dict[str, list[ReportFile]] = {}
-    for item in group.files:
-        if item.unstable:
-            continue
-        clusters.setdefault(_identity(item), []).append(item)
-    return list(clusters.values())
+    return cluster_files(group.files)
 
 
 def _cluster_occupancy(cluster: list[ReportFile], fallback: int = 0) -> int:
@@ -113,10 +126,7 @@ def _cluster_occupancy(cluster: list[ReportFile], fallback: int = 0) -> int:
 
     报告缺少 ``sizeOnDisk`` 时退回组内逻辑大小，避免把可节省空间算成 0。
     """
-    sizes = [
-        item.size_on_disk if item.size_on_disk is not None else fallback for item in cluster
-    ]
-    return max(sizes) if sizes else 0
+    return cluster_occupancy(cluster, fallback)
 
 
 def _normalized_key(file: ReportFile) -> tuple[int, int, str, str]:
@@ -148,9 +158,14 @@ def choose_keep_cluster(clusters: list[list[ReportFile]], mode: str) -> list[Rep
 # ---------------------------------------------------------------------------
 
 
+#: 预检发现文件已不在原处时的固定原因；调用方据此区分「已经处置过的
+#: 旧副本」和「内容不符/受保护」这类真正阻止移动的问题
+MISSING_PROBLEM = "文件不存在或不是普通文件"
+
+
 def _validate_live_file(group: ReportGroup, item: ReportFile) -> str | None:
     if not os.path.isfile(long_path(item.path)):
-        return "文件不存在或不是普通文件"
+        return MISSING_PROBLEM
     try:
         info = os.stat(long_path(item.path))
     except PermissionError:
@@ -164,28 +179,34 @@ def _validate_live_file(group: ReportGroup, item: ReportFile) -> str | None:
     return None
 
 
-def _is_protected_cluster(cluster: list[ReportFile]) -> bool:
-    return any(protected_reason(item.path) is not None for item in cluster)
+def _is_protected_cluster(cluster: list[ReportFile], cache: CanonicalCache | None = None) -> bool:
+    return any(protected_reason(item.path, cache) is not None for item in cluster)
 
 
-def _is_in_trash(path: str, trash: str | None) -> bool:
+def _is_in_trash(path: str, trash: str | None, cache: CanonicalCache | None = None) -> bool:
     """文件是否已经躺在隔离区里（按规约后的真实路径判断）。"""
     if not trash:
         return False
     try:
-        return ntpath.commonpath([canonical(path), canonical(trash)]) == canonical(trash)
+        # 隔离区目录本身可能是 junction，且可能带尾分隔符 —— 用
+        # canonical_directory 完整解析，否则 commonpath 比较会失配，
+        # 把「已在隔离区」的副本当成普通文件，甚至选为保留项
+        trash_key = cache.canonical_directory(trash) if cache is not None else canonical(trash)
+        path_key = cache.canonical(path) if cache is not None else canonical(path)
+        return ntpath.commonpath([path_key, trash_key]) == trash_key
     except ValueError:
         return False
 
 
-def _trash_cluster(cluster: list[ReportFile], trash: str | None) -> bool:
-    return any(_is_in_trash(item.path, trash) for item in cluster)
+def _trash_cluster(cluster: list[ReportFile], trash: str | None, cache: CanonicalCache | None = None) -> bool:
+    return any(_is_in_trash(item.path, trash, cache) for item in cluster)
 
 
 def plan_group(
     group: ReportGroup,
     mode: str = "shortest",
     trash: str | None = None,
+    cache: CanonicalCache | None = None,
 ) -> tuple[list[ReportFile], list[list[ReportFile]], str | None]:
     """返回 (保留簇, 待删簇列表, 问题)。
 
@@ -205,14 +226,14 @@ def plan_group(
             return [], [], "组内没有可处置文件"
         return [], [], "组内只有一份物理数据（硬链接），无可节省空间"
 
-    protected = [cluster for cluster in clusters if _is_protected_cluster(cluster)]
+    protected = [cluster for cluster in clusters if _is_protected_cluster(cluster, cache)]
     if len(protected) >= 2:
         return [], [], "组内有多份位于受保护目录的数据，无法安全处置"
 
     if protected:
         keep = protected[0]
     else:
-        outside = [cluster for cluster in clusters if not _trash_cluster(cluster, trash)]
+        outside = [cluster for cluster in clusters if not _trash_cluster(cluster, trash, cache)]
         if not outside:
             return [], [], "组内所有副本都已位于隔离区，无可安全处置的文件"
         keep = choose_keep_cluster(outside, mode)
@@ -225,7 +246,7 @@ def plan_group(
             except TrashError as exc:
                 return [], [], str(exc)
             # 受保护簇已作为 keep 排除；这里命中说明 keep 选错或数据异常
-            reason = protected_reason(item.path)
+            reason = protected_reason(item.path, cache)
             if reason is not None:
                 return [], [], f"拒绝处置受保护路径：{reason}"
     return keep, removals, None
@@ -263,17 +284,27 @@ def build_plan(
     selected = set(group_ids) if group_ids is not None else None
     mode = options.keep_mode if options.keep_mode != "ask" else "shortest"
     plan = DisposalPlan(mode=mode)
+    cache = CanonicalCache()
 
     for group in document.groups:
         if selected is not None and group.id not in selected:
             continue
+        if group.id in options.skip_group_ids:
+            plan.skipped.append((group.id, "已处置或已忽略"))
+            continue
         if group.status != "confirmed":
             plan.skipped.append((group.id, "非确认组"))
             continue
-        if group.savings_bytes < options.min_savings:
+        # 忽略目录里的文件既不展示也不处置；跨忽略边界的分组按剩余副本重算，
+        # 剩余不足两份就直接跳过，绝不「看不见却动了它」。
+        effective = effective_group(group, options.ignore)
+        if effective is None:
+            plan.skipped.append((group.id, "组内文件位于忽略目录"))
+            continue
+        if effective.savings_bytes < options.min_savings:
             plan.skipped.append((group.id, "低于最小可节省阈值"))
             continue
-        keep, removals, problem = plan_group(group, mode, trash=options.trash_dir)
+        keep, removals, problem = plan_group(effective, mode, trash=options.trash_dir, cache=cache)
         if problem is not None:
             plan.skipped.append((group.id, problem))
             continue
@@ -289,10 +320,14 @@ def execute_plan(
     *,
     on_progress: Callable[[int, int], None] | None = None,
     stats: ApplyStats | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> ApplyStats:
     """执行 :func:`build_plan` 的结果，返回统计。
 
     ``on_progress(已处理组数, 总组数)`` 每处理完一组回调一次，供 Web 进度条使用。
+
+    ``should_stop`` 只在**组边界**检查：一组文件要么整簇移动、要么不动，
+    中途停止会留下「保留项已走、副本还在」的半成品，比多等一组更糟。
 
     ``stats`` 允许调用方预先提供统计对象：中途抛异常时，异常会穿过这个
     函数，而**已经移动的文件数**只存在于这个对象里。调用方把它留着，就能
@@ -305,6 +340,9 @@ def execute_plan(
     total = len(plan.groups)
     try:
         for processed, planned in enumerate(plan.groups, start=1):
+            if should_stop is not None and should_stop():
+                stats.cancelled = True
+                break
             group = by_id.get(planned.group_id)
             if group is None:
                 continue
@@ -330,16 +368,23 @@ class _Executor:
         self._stats = stats
         self._trash = TrashManager(options.trash_dir)
         self._manifest: Manifest | None = None
+        self._cache = CanonicalCache()
 
     @property
     def stats(self) -> ApplyStats:
         return self._stats
 
+    @property
+    def manifest_path(self) -> str | None:
+        return self._manifest.path if self._manifest is not None else None
+
     def _ensure_manifest(self) -> Manifest:
         if self._manifest is None:
             self._trash.ensure()
-            self._manifest = Manifest(self._trash.path, str(self._document.path))
+            # report 字段会被 restore 从任意工作目录读取，必须是绝对路径
+            self._manifest = Manifest(self._trash.path, ntpath.abspath(str(self._document.path)))
             self._manifest.save()
+            self._stats.manifest_path = self._manifest.path
         return self._manifest
 
     def close(self) -> None:
@@ -356,50 +401,143 @@ class _Executor:
         # 保留簇内的「代表路径」按实际策略选，否则 --keep newest 时会打印错文件
         keeper = choose_keep(keep, mode)
         say(f"  保留: {keeper.path}" + (f"（另有 {len(keep) - 1} 个硬链接路径）" if len(keep) > 1 else ""))
-        for cluster in removals:
-            freed = _cluster_occupancy(cluster, group.size)
-            # 整簇全部移走才算释放了这份物理数据；有一个失败就保守地不计入
-            all_moved = True
-            for item in cluster:
-                all_moved = self._move_one(group, item, keeper) and all_moved
-            if all_moved:
-                self._stats.moved_bytes += freed
-        self._stats.handled_groups += 1
+        stats = self._stats
+        before = (
+            stats.moved_files,
+            stats.moved_bytes,
+            stats.skipped_files,
+            stats.failed_files,
+            stats.missing_files,
+        )
+        if self._options.dry_run:
+            self._dry_run_clusters(group, keeper, removals)
+        else:
+            self._move_clusters_reserved(group, keeper, removals)
+        moved = stats.moved_files - before[0]
+        skipped = stats.skipped_files - before[2]
+        failed = stats.failed_files - before[3]
+        missing = stats.missing_files - before[4]
+        # 「文件已不在原处」不算阻塞：它多半是上一次部分处置时已经移走的
+        # 副本。重试一个 partial 组时，若剩下的文件全部成功、其余都已不存在，
+        # 这一组实际上已经处置完，必须允许升级为 handled，否则永远停在
+        # 「部分处置」；反之，内容不符、受保护、移动失败才是真正没做完。
+        blocked = skipped - missing + failed
+        if moved > 0 or (missing > 0 and blocked == 0):
+            state = "handled" if blocked == 0 else "partial"
+            stats.group_results[group.id] = (state, moved, stats.moved_bytes - before[1])
+        stats.processed_group_ids.append(group.id)
+        stats.handled_groups += 1
 
-    def _move_one(self, group: ReportGroup, item: ReportFile, keeper: ReportFile) -> bool:
+    def _count_skip(self, problem: str) -> None:
+        self._stats.skipped_files += 1
+        if problem == MISSING_PROBLEM:
+            self._stats.missing_files += 1
+
+    def _dry_run_clusters(
+        self, group: ReportGroup, keeper: ReportFile, removals: list[list[ReportFile]]
+    ) -> None:
+        stats = self._stats
+        for cluster in removals:
+            completed = True
+            for item in cluster:
+                problem = self._precheck(group, item, keeper)
+                if problem is not None:
+                    self._count_skip(problem)
+                    say(f"  [跳过] {item.path} —— {problem}")
+                    completed = False
+                    continue
+                try:
+                    target = self._trash.target_for(item.path)
+                except TrashError as exc:
+                    stats.skipped_files += 1
+                    say(f"  [跳过] {item.path} —— {exc}")
+                    completed = False
+                    continue
+                say(f"  [DRY-RUN] 移动 {item.path} -> {target}")
+                stats.moved_files += 1
+            if completed:
+                stats.moved_bytes += _cluster_occupancy(cluster, group.size)
+
+    def _move_clusters_reserved(
+        self, group: ReportGroup, keeper: ReportFile, removals: list[list[ReportFile]]
+    ) -> None:
+        """先把整组动作登记进 journal 并落盘，再逐个移动。
+
+        每个文件移动前都 fsync 一次 journal 要 27ms/文件，全量处置会多出十几
+        分钟；不落盘就移动则违背「崩溃可恢复」：文件已在隔离区、记录却丢了，
+        就再也找不回来。折中：整组动作先登记、一次 fsync，然后移动。崩溃最多
+        留下「登记了但没移动」的 pending —— restore 把 pending 当可还原时会
+        发现目标不存在并跳过，不会误删任何东西。
+        """
+        stats = self._stats
+        # 先预检、后建 manifest：若所有文件都已不在原处（重复执行同一组），
+        # 不应留下一个空隔离区目录和 actions:[] 的空 manifest。
+        prepared: list[tuple[list[ReportFile], list[tuple[ReportFile, str]]]] = []
+        for cluster in removals:
+            entries: list[tuple[ReportFile, str]] = []
+            for item in cluster:
+                problem = self._precheck(group, item, keeper)
+                if problem is not None:
+                    self._count_skip(problem)
+                    say(f"  [跳过] {item.path} —— {problem}")
+                    continue
+                try:
+                    target = self._trash.target_for(item.path)
+                except TrashError as exc:
+                    stats.skipped_files += 1
+                    say(f"  [跳过] {item.path} —— {exc}")
+                    continue
+                entries.append((item, target))
+            prepared.append((cluster, entries))
+        if not any(entries for _, entries in prepared):
+            return
+        manifest = self._ensure_manifest()
+        registered: list[tuple[list[ReportFile], list[tuple[ReportFile, str, dict[str, object]]]]] = []
+        for cluster, entries in prepared:
+            actions: list[tuple[ReportFile, str, dict[str, object]]] = []
+            for item, target in entries:
+                action = manifest.add(
+                    group_id=group.id,
+                    source=item.path,
+                    target=target,
+                    size=group.size,
+                    durable=False,
+                )
+                actions.append((item, target, action))
+            registered.append((cluster, actions))
+        # 整组登记一次性落盘；之后才允许移动
+        manifest.sync()
+        for cluster, actions in registered:
+            all_moved = len(actions) == len(cluster)
+            for item, target, action in actions:
+                all_moved = self._move_reserved_one(manifest, item, target, action) and all_moved
+            if all_moved:
+                # 整簇全部移走才算释放了这份物理数据；有一个失败就保守地不计入
+                stats.moved_bytes += _cluster_occupancy(cluster, group.size)
+
+    def _precheck(self, group: ReportGroup, item: ReportFile, keeper: ReportFile) -> str | None:
         # 最后一道防线：无论上层如何规划，受保护路径一律不移动
-        protected = protected_reason(item.path)
+        protected = protected_reason(item.path, self._cache)
         if protected is not None:
-            self._stats.skipped_files += 1
-            say(f"  [跳过] {item.path} —— 受保护路径（{protected}）")
-            return False
+            return f"受保护路径（{protected}）"
         problem = _validate_live_file(group, item)
         if problem is not None:
-            self._stats.skipped_files += 1
-            say(f"  [跳过] {item.path} —— {problem}")
-            return False
+            return problem
         if self._options.verify_content:
             matches, reason = content_matches(item.path, keeper.path, group.size, self._options.sample_size)
             if not matches:
-                self._stats.skipped_files += 1
-                say(f"  [跳过] {item.path} —— 内容复核失败：{reason}")
-                return False
-        try:
-            target = self._trash.target_for(item.path)
-        except TrashError as exc:
-            self._stats.skipped_files += 1
-            say(f"  [跳过] {item.path} —— {exc}")
-            return False
+                return f"内容复核失败：{reason}"
+        return None
 
-        if self._options.dry_run:
-            say(f"  [DRY-RUN] 移动 {item.path} -> {target}")
-            self._stats.moved_files += 1
-            return True
-
-        manifest = self._ensure_manifest()
-        action = manifest.add(group_id=group.id, source=item.path, target=target, size=group.size)
+    def _move_reserved_one(
+        self,
+        manifest: Manifest,
+        item: ReportFile,
+        target: str,
+        action: dict[str, object],
+    ) -> bool:
         try:
-            os.makedirs(ntpath.dirname(target), exist_ok=True)
+            os.makedirs(long_path(ntpath.dirname(target)), exist_ok=True)
             shutil.move(item.path, target)
         except OSError:
             if not move_file(item.path, target):
@@ -424,16 +562,24 @@ def run_apply(
     say(f"trash: {options.trash_dir}    模式: {'dry-run（不移动）' if options.dry_run else '实际移动'}")
     say()
 
-    for group_id, problem in plan.skipped:
-        say(f"[跳过组 #{group_id}] {problem}")
+    if plan.skipped:
+        reason_counts: dict[str, int] = {}
+        for _, problem in plan.skipped:
+            reason_counts[problem] = reason_counts.get(problem, 0) + 1
+        summary = "，".join(
+            f"{reason} {count} 组" for reason, count in sorted(reason_counts.items(), key=lambda item: -item[1])
+        )
+        say(f"跳过 {len(plan.skipped)} 组：{summary}")
+        for group_id, problem in plan.skipped[:10]:
+            say(f"  [跳过组 #{group_id}] {problem}")
+        if len(plan.skipped) > 10:
+            say(f"  …… 另有 {len(plan.skipped) - 10} 组")
+        say()
 
     has_confirmed = any(group.status == "confirmed" for group in document.groups)
     if not plan.groups:
         say("没有可处理的确认重复组。")
         return 0 if has_confirmed else 1
-    if plan.skipped:
-        say(f"（另有 {len(plan.skipped)} 组未纳入本次处置：非确认/低于阈值/无可节省空间/受保护）")
-        say()
 
     try:
         executor = _Executor(document, options, ApplyStats())
@@ -451,6 +597,15 @@ def run_apply(
     finally:
         executor.close()
 
+    if not options.dry_run and stats.group_results:
+        try:
+            saved = record_apply_result(document, stats.group_results, manifest=executor.manifest_path)
+        except OSError:
+            saved = False
+        if saved:
+            say(f"已记录 {len(stats.group_results)} 组的处置状态（下次加载报告时显示为已处置）")
+        else:
+            say("  [警告] 处置状态写入失败；下次加载报告时这些组可能仍显示为待处理（manifest 仍可还原）")
     say()
     prefix = "（dry-run：未移动任何文件）" if options.dry_run else ""
     say(
@@ -462,11 +617,15 @@ def run_apply(
 
 def _apply_with_strategy(group: ReportGroup, options: ApplyOptions, executor: _Executor) -> None:
     mode = options.keep_mode if options.keep_mode != "ask" else "shortest"
-    keep, removals, problem = plan_group(group, mode, trash=options.trash_dir)
+    effective = effective_group(group, options.ignore)
+    if effective is None:
+        say(f"[跳过组 #{group.id}] 组内文件位于忽略目录")
+        return
+    keep, removals, problem = plan_group(effective, mode, trash=options.trash_dir)
     if problem is not None:
         say(f"[跳过组 #{group.id}] {problem}")
         return
-    say(f"\n组 #{group.id}（{format_size(group.size)}，可节省 {format_size(group.savings_bytes)}）")
+    say(f"\n组 #{group.id}（{format_size(group.size)}，可节省 {format_size(effective.savings_bytes)}）")
     executor.move_clusters(group, keep, removals, mode)
 
 
@@ -486,7 +645,7 @@ def _interactive(
         if not pending:
             page_start += page_size
             continue
-        _print_page(page, decisions, page_start, len(groups))
+        _print_page(page, decisions, page_start, len(groups), options.ignore)
         command = _read_command(input_func, len(page))
         if command == "q":
             say("已退出，已完成操作均已落盘。")
@@ -528,18 +687,28 @@ def _interactive(
             continue
 
 
-def _print_page(page: list[ReportGroup], decisions: dict[int, str], page_start: int, total: int) -> None:
+def _print_page(
+    page: list[ReportGroup],
+    decisions: dict[int, str],
+    page_start: int,
+    total: int,
+    ignore: IgnoreList | None = None,
+) -> None:
     say()
     say(f"=== 第 {page_start + 1}-{page_start + len(page)} 组 / 共 {total} 组 ===")
     for index, group in enumerate(page, start=1):
         state = decisions.get(group.id)
         marker = {"apply": " [已处理]", "skip": " [已跳过]"}.get(state or "", "")
-        clusters = physical_clusters(group)
-        links = len(group.files) - len(clusters)
+        effective = effective_group(group, ignore)
+        if effective is None:
+            say(f"[{index}] #{group.id}  组内文件位于忽略目录，跳过")
+            continue
+        clusters = physical_clusters(effective)
+        links = len(effective.files) - len(clusters)
         link_note = f"，含 {links} 个硬链接路径" if links > 0 else ""
         say(
             f"[{index}] #{group.id}  {format_size(group.size)}  "
-            f"可节省 {format_size(group.savings_bytes)}  "
+            f"可节省 {format_size(effective.savings_bytes)}  "
             f"{len(clusters)} 份物理数据{link_note}{marker}"
         )
         for cluster in clusters:
@@ -575,7 +744,11 @@ def _choose_group_files(
     input_func: Callable[[str], str],
 ) -> str:
     """返回 "apply" / "skip"；无效输入时返回空串表示本组仍未处理。"""
-    clusters = physical_clusters(group)
+    effective = effective_group(group, options.ignore)
+    if effective is None:
+        say(f"[跳过组 #{group.id}] 组内文件位于忽略目录")
+        return "skip"
+    clusters = physical_clusters(effective)
     if len(clusters) < 2:
         say(f"[跳过组 #{group.id}] 组内只有一份物理数据，无可节省空间")
         return "skip"

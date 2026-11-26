@@ -61,6 +61,9 @@ class ManifestDocument:
     path: Path
     trash: str
     actions: list[Action] = field(default_factory=list)
+    #: 该批动作对应的报告路径（旧版 manifest 可能没有）。用于把处置结果
+    #: 回填到报告状态，以及还原后把对应组恢复为「待处理」。
+    report: str | None = None
 
     @property
     def restorable(self) -> list[Action]:
@@ -124,8 +127,13 @@ def _parse_action(raw: Any) -> Action | None:
         size = int(raw.get("size", 0))
     except (TypeError, ValueError):
         size = 0
+    try:
+        group_id = int(raw.get("groupId", 0) or 0)
+    except (TypeError, ValueError):
+        # 畸形 manifest 不能让整份记录无法加载；groupId=0 会被状态回填忽略
+        group_id = 0
     return Action(
-        group_id=int(raw.get("groupId", 0) or 0),
+        group_id=group_id,
         src=src,
         dst=dst,
         size=size,
@@ -184,12 +192,17 @@ def load_manifest(path: str | Path) -> ManifestDocument:
         raise RestoreError(f"manifest 不存在: {manifest_path}")
 
     merged: dict[tuple[str, str], Action] = {}
+    report: str | None = None
     if snapshot_path.is_file():
         try:
             data = read_json(snapshot_path)
         except (OSError, ValueError) as exc:
             raise RestoreError(f"manifest 无法解析: {exc}") from exc
         merged.update(_collect_snapshot(data))
+        if isinstance(data, dict):
+            raw_report = data.get("report")
+            if isinstance(raw_report, str) and raw_report.strip():
+                report = raw_report
 
     # journal 覆盖快照：崩溃时快照可能停在旧状态，journal 才是最新事实
     if journal_path is not None and journal_path.is_file():
@@ -201,7 +214,7 @@ def load_manifest(path: str | Path) -> ManifestDocument:
     trash = str(ntpath.dirname(ntpath.abspath(str(snapshot_path))))
 
     actions = sorted(merged.values(), key=lambda action: (action.group_id, action.src))
-    return ManifestDocument(path=snapshot_path, trash=trash, actions=actions)
+    return ManifestDocument(path=snapshot_path, trash=trash, actions=actions, report=report)
 
 
 def discover_manifests(target: str | Path) -> list[Path]:
@@ -300,7 +313,7 @@ def _move_back(src: str, dst: str, *, replace: bool = False) -> bool:
     （原盘符可能已拔掉、原目录可能已无权限）。
     """
     try:
-        os.makedirs(ntpath.dirname(src), exist_ok=True)
+        os.makedirs(long_path(ntpath.dirname(src)), exist_ok=True)
     except OSError:
         return False
     if not replace:
@@ -325,6 +338,7 @@ def run_restore(target: str | Path, options: RestoreOptions) -> int:
 
     documents = [load_manifest(path) for path in discover_manifests(target)]
     stats = RestoreStats()
+    touched: dict[str, str] = {}
 
     say(f"模式: {'dry-run（不移动）' if options.dry_run else '实际还原'}")
     for document in documents:
@@ -347,7 +361,18 @@ def run_restore(target: str | Path, options: RestoreOptions) -> int:
                 pass
 
         if changed:
-            _persist(document)
+            # 写回失败时不能同步状态：manifest 仍是 completed，同步会把刚
+            # 还原的组重新标成已处置，下一次打开报告又是错的
+            if _persist(document) and document.report:
+                touched[document.report] = document.trash
+
+    if touched:
+        # 还原后这些组必须回到「待处理」，否则页面还说它们已处置，用户
+        # 既不能再勾选、也看不到文件其实已经回来了。
+        from .report_state import sync_after_restore
+
+        for report_path, trash_dir in touched.items():
+            sync_after_restore(report_path, trash_dir)
 
     say()
     prefix = "（dry-run：未移动任何文件）" if options.dry_run else ""
@@ -376,10 +401,19 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
         say(f"  [已是同一文件] {action.src}")
         return "skipped"
 
-    # 幂等：原位置已有文件、隔离区已无文件 → 视为已还原
+    # 幂等：原位置已有文件、隔离区已无文件。
     if src_exists and not dst_exists:
+        if action.status == "completed":
+            # 上一次确实移动过（completed），但可能在写快照前崩溃 —— 必须
+            # 按 restored 处理并落盘。只当 skipped 的话 manifest 会永远停在
+            # completed，状态文件也就永远显示「已处置」，无法恢复为待处理。
+            stats.restored += 1
+            stats.restored_bytes += action.size
+            say(f"  [已还原] {action.src}")
+            return "restored"
+        # pending：只是登记了、移动根本没发生，没有可还原的动作
         stats.skipped += 1
-        say(f"  [已还原] {action.src}")
+        say(f"  [未移动] {action.src}（登记后没有移动，无需还原）")
         return "skipped"
     if not dst_exists:
         stats.missing += 1
@@ -416,8 +450,8 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
     return "restored"
 
 
-def _persist(document: ManifestDocument) -> None:
-    """把已还原的动作写回快照，使重复执行时自动跳过。"""
+def _persist(document: ManifestDocument) -> bool:
+    """把已还原的动作写回快照，使重复执行时自动跳过；返回是否成功。"""
     payload: dict[str, Any] = {
         "version": MANIFEST_VERSION,
         "createdAt": iso_now(),
@@ -433,6 +467,8 @@ def _persist(document: ManifestDocument) -> None:
     payload["version"] = MANIFEST_VERSION
     payload["restoredAt"] = iso_now()
     payload["trash"] = document.trash
+    if document.report:
+        payload["report"] = document.report
     payload["actions"] = [
         {
             "groupId": action.group_id,
@@ -448,14 +484,18 @@ def _persist(document: ManifestDocument) -> None:
         write_json_atomic(document.path, payload)
     except OSError as exc:
         say(f"  [警告] 无法写回 manifest：{exc}")
-        return
+        return False
     # journal 里的旧状态会覆盖刚写回的快照（load_manifest 中 journal 优先），
     # 不删掉的话下次执行看到的仍是 completed，写回等于白做。
     journal = Path(str(document.path) + JOURNAL_SUFFIX)
     try:
         journal.unlink()
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        say(f"  [警告] 无法清理 journal：{exc}（下次仍可能显示为未还原）")
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +509,16 @@ def _validate_trash(trash: str) -> str:
     ``empty`` 是不可逆操作，这里必须比 ``apply`` 更严格 —— 用户完全可能手滑
     写成 ``dupfind empty C:\\Windows``。
     """
-    resolved = canonical(trash)
+    text = str(trash or "").strip().replace("/", "\\")
+    if text.startswith("\\\\?\\UNC\\"):
+        raise RestoreError(f"trash 必须是本地盘符路径: {trash}")
+    if text.startswith("\\\\?\\"):
+        text = text[len("\\\\?\\") :]
+    if not ntpath.isabs(text):
+        raise RestoreError(f"trash 必须是本地绝对路径: {trash}")
+    if text.startswith("\\\\"):
+        raise RestoreError(f"trash 必须是本地盘符路径（不接受 UNC 共享）: {trash}")
+    resolved = canonical(text)
     drive, rest = ntpath.splitdrive(resolved)
     if not drive:
         raise RestoreError(f"trash 必须是本地绝对路径: {trash}")
@@ -481,9 +530,9 @@ def _validate_trash(trash: str) -> str:
         raise RestoreError(f"拒绝清空受保护目录: {trash}（{reason}）")
     # 根目录本身是 junction/符号链接时，os.walk 会顺着它删到别处去。
     # 真实隔离区是 dupfind 自己建的普通目录，不会出现这种情况。
-    if _is_reparse_point(trash):
+    if _is_reparse_point(text):
         raise RestoreError(f"拒绝清空符号链接/junction: {trash}")
-    return os.path.abspath(trash)
+    return os.path.abspath(text)
 
 
 def _collect_trash(root: str) -> tuple[list[Path], list[Path], int, int]:
@@ -527,7 +576,16 @@ def _collect_trash(root: str) -> tuple[list[Path], list[Path], int, int]:
             if is_dir:
                 visit(entry.path)
                 continue
-            if at_root and _MANIFEST_NAME.match(path.name):
+            if at_root and (
+                _MANIFEST_NAME.match(path.name)
+                or (
+                    path.name.endswith(JOURNAL_SUFFIX)
+                    and _MANIFEST_NAME.match(path.name[: -len(JOURNAL_SUFFIX)])
+                )
+            ):
+                # journal 与快照是同一份记录，必须一起保留或一起删除：
+                # 漏掉 journal 会让崩溃后的最新动作被当成普通 payload 删掉，
+                # 保留下来的空快照又让 restore 以为「没有可还原的动作」。
                 manifests.append(Path(strip_long_prefix(entry.path)))
                 continue
             files.append(Path(strip_long_prefix(entry.path)))
@@ -549,8 +607,10 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
     stats = EmptyStats()
     files, manifests, skipped_links, total_bytes = _collect_trash(root)
     stats.removed_bytes = total_bytes
+    # manifests 里还混着 .json.journal（与快照同生共死），计数时只算快照
+    snapshot_count = sum(1 for path in manifests if not path.name.endswith(JOURNAL_SUFFIX))
     if options.keep_manifests:
-        stats.kept_manifests = len(manifests)
+        stats.kept_manifests = snapshot_count
     if skipped_links:
         say(f"跳过 {skipped_links} 个符号链接/junction（不跟随，避免越界删除）")
 
@@ -567,9 +627,9 @@ def run_empty(trash: str, options: EmptyOptions) -> int:
     say(f"待删除 {len(files)} 个文件，{format_size(stats.removed_bytes)}")
     if manifests:
         if options.keep_manifests:
-            say(f"保留 {len(manifests)} 个 manifest（还原记录；用 --purge-manifests 一并删除）")
+            say(f"保留 {snapshot_count} 个 manifest（还原记录；用 --purge-manifests 一并删除）")
         else:
-            say(f"另有 {len(manifests)} 个 manifest 将一并删除")
+            say(f"另有 {snapshot_count} 个 manifest 将一并删除")
 
     if not files and not (manifests and not options.keep_manifests):
         # 没有 payload 可删时仍然清理空目录：restore 之后镜像目录会留下空壳

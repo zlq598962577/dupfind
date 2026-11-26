@@ -10,7 +10,7 @@ from datetime import datetime
 
 from .jsonio import write_json_atomic
 from .units import iso_now
-from .win32 import long_path
+from .win32 import close_handle, long_path, open_exclusive
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
 MANIFEST_VERSION = 1
@@ -188,8 +188,36 @@ class Manifest:
                 pass
         self._dirty = True
 
-    def add(self, *, group_id: int, source: str, target: str, size: int, status: str = "pending") -> dict[str, object]:
-        """登记一个待执行动作，返回可交给 :meth:`mark` 更新的句柄。"""
+    def sync(self) -> None:
+        """把 journal 缓冲落盘（fsync）。
+
+        批量处置时不必每个动作都 fsync：整组动作先以 ``durable=False`` 登记，
+        再调用一次 ``sync``，随后才移动文件。崩溃最多留下「已登记未移动」的
+        pending，restore 会发现目标不存在并跳过，不会丢记录。
+        """
+        if self._journal is None:
+            return
+        self._journal.flush()
+        try:
+            os.fsync(self._journal.fileno())
+        except OSError:
+            pass
+
+    def add(
+        self,
+        *,
+        group_id: int,
+        source: str,
+        target: str,
+        size: int,
+        status: str = "pending",
+        durable: bool = True,
+    ) -> dict[str, object]:
+        """登记一个待执行动作，返回可交给 :meth:`mark` 更新的句柄。
+
+        ``durable=False`` 只 flush 不 fsync，适合「整组登记后统一 :meth:`sync`」
+        的批量路径；留空（默认）保持「移动前必须落盘」的单文件语义。
+        """
         action: dict[str, object] = {
             "groupId": group_id,
             "src": source,
@@ -202,7 +230,7 @@ class Manifest:
         assert isinstance(actions, list)
         actions.append(action)
         # 移动发生前必须持久化，崩溃时才知道该还原什么
-        self._append_journal(action, durable=True)
+        self._append_journal(action, durable=durable)
         return action
 
     def mark(self, action: dict[str, object], *, status: str, error: str | None = None) -> None:
@@ -254,3 +282,74 @@ class Manifest:
                 os.unlink(long_path(self._journal_path))
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# 跨进程隔离区锁
+# ---------------------------------------------------------------------------
+
+TRASH_LOCK_SUFFIX = ".lock"
+
+
+class TrashBusy(RuntimeError):
+    """同一隔离区已有处置任务在跑。"""
+
+
+def _lock_path(trash: str) -> str:
+    """锁文件放在隔离区的**同级**，不能放进去。
+
+    放进隔离区的话，``empty`` 会把它当 payload 删掉（目录里所有非 manifest
+    文件都会被 unlink），锁就凭空消失，互斥失效。同级文件在 ``empty`` 的
+    遍历范围之外，且随隔离区一起消失（用户删掉隔离区时锁也自然没了）。
+    """
+    parent = ntpath.dirname(ntpath.normpath(trash))
+    name = ntpath.basename(ntpath.normpath(trash))
+    return ntpath.join(parent, f".{name}{TRASH_LOCK_SUFFIX}")
+
+
+class TrashLock:
+    r"""跨进程的隔离区互斥（独占句柄，进程退出即释放）。
+
+    为什么必须有：apply 把文件移入 ``<盘符>:\_dupfind_trash`` 的过程中，
+    另一个标签页/第二个 web 实例/CLI 对同一隔离区执行 ``empty``，会把这些
+    刚移入的文件逐个 unlink。apply 的 manifest 仍记为 completed，之后
+    ``restore`` 只会报「缺失」并以成功结束 —— 用户完全察觉不到唯一副本
+    已经被删掉。
+
+    用 ``CreateFileW`` 的独占共享模式实现，而不是内存锁：CLI 和另一个 web
+    实例是不同进程，内存里的 ``threading.Lock`` 管不到它们。
+    """
+
+    __slots__ = ("_handle", "_path")
+
+    def __init__(self, trash: str) -> None:
+        self._path = _lock_path(trash)
+        self._handle: int | None = None
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def acquire(self) -> None:
+        try:
+            os.makedirs(ntpath.dirname(self._path) or ".", exist_ok=True)
+            self._handle = open_exclusive(self._path)
+        except OSError as exc:
+            raise TrashBusy(
+                f"隔离区正被另一个处置任务使用，请等它结束后再试：{ntpath.dirname(self._path)}"
+            ) from exc
+
+    def release(self) -> None:
+        if self._handle is not None:
+            try:
+                close_handle(self._handle)
+            finally:
+                self._handle = None
+
+    def __enter__(self) -> TrashLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.release()
+        return False

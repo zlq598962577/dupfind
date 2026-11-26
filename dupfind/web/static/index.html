@@ -129,19 +129,43 @@
     </div>
 
     <section class="card toolbar" id="toolbar" hidden>
+      <div class="banner type-banner" id="typeBanner" hidden>
+        <span id="typeBannerText">当前只显示用户文件</span>
+        <button class="ghost-btn small" id="typeShowAllBtn" type="button">显示全部类型</button>
+      </div>
+      <div class="banner state-banner" id="stateBanner" hidden>
+        <span id="stateBannerText">已处置 0 组</span>
+        <button class="ghost-btn small" id="stateShowHandledBtn" type="button">查看已处置</button>
+        <button class="ghost-btn small" id="stateShowIgnoredBtn" type="button">查看已忽略</button>
+      </div>
+
       <div class="toolbar-row">
         <div class="search">
           <span class="search-icon" aria-hidden="true">⌕</span>
           <input id="searchInput" type="search" placeholder="搜索文件名或路径…" autocomplete="off" aria-label="搜索文件名或路径" />
         </div>
-        <div class="segmented" id="statusFilter" role="group" aria-label="按状态筛选">
-          <button type="button" data-status="all" class="segment active">全部 <span data-count="all">0</span></button>
+        <div class="segmented" id="disposalFilter" role="group" aria-label="按处置状态筛选">
+          <button type="button" data-disposal="pending" class="segment active">待处理 <span data-count="pending">0</span></button>
+          <button type="button" data-disposal="handled" class="segment">已处置 <span data-count="handled">0</span></button>
+          <button type="button" data-disposal="ignored" class="segment">已忽略 <span data-count="ignored">0</span></button>
+          <button type="button" data-disposal="all" class="segment">全部 <span data-count="disposalAll">0</span></button>
+        </div>
+      </div>
+
+      <div class="toolbar-row second">
+        <div class="segmented" id="typeFilter" role="group" aria-label="按文件类型筛选">
+          <button type="button" data-category="user" class="segment active">用户文件 <span data-count="user">0</span></button>
+          <button type="button" data-category="all" class="segment">全部类型 <span data-count="typeAll">0</span></button>
+        </div>
+        <div class="segmented" id="statusFilter" role="group" aria-label="按扫描结论筛选">
+          <button type="button" data-status="all" class="segment active">全部结论 <span data-count="all">0</span></button>
           <button type="button" data-status="confirmed" class="segment">确认 <span data-count="confirmed">0</span></button>
           <button type="button" data-status="suspect" class="segment">疑似 <span data-count="suspect">0</span></button>
           <button type="button" data-status="shared" class="segment">硬链接 <span data-count="shared">0</span></button>
         </div>
       </div>
-      <div class="toolbar-row second">
+
+      <div class="toolbar-row third">
         <label class="inline-field">
           <span>最小可节省</span>
           <input id="minSavingsInput" placeholder="0" autocomplete="off" />
@@ -153,13 +177,29 @@
             <option value="newest">最新修改</option>
           </select>
         </label>
+        <label class="switch small-switch">
+          <input type="checkbox" id="verifyContentInput" checked />
+          <span class="switch-track"></span>
+          <span class="switch-text">移动前复核内容（更安全，较慢）</span>
+        </label>
         <span class="result-count" id="resultCount">0 组</span>
       </div>
-      <div class="toolbar-row third">
-        <button class="secondary-btn small" id="selectPageBtn" type="button">选中本页可处置组</button>
+
+      <div class="toolbar-row fourth">
+        <span class="row-label">批量选择</span>
+        <button class="secondary-btn small" id="selectPageBtn" type="button">本页</button>
+        <button class="secondary-btn small" id="selectAllBtn" type="button">全部筛选结果</button>
+        <button class="secondary-btn small" id="selectTop100Btn" type="button">释放最多 100 组</button>
+        <button class="secondary-btn small" id="minSavingsPresetBtn" type="button">≥1MB 全选</button>
         <button class="ghost-btn small" id="clearSelectionBtn" type="button">清除选择</button>
-        <span class="hint" id="selectionHint">硬链接组、疑似组与受保护路径不可勾选</span>
       </div>
+      <p class="hint toolbar-hint" id="selectionHint">硬链接组、疑似组、已处置组与受保护路径不可勾选</p>
+
+      <details class="dir-panel" id="dirPanel" hidden>
+        <summary>按目录查看 / 忽略</summary>
+        <div class="dir-list" id="dirList"></div>
+        <div class="dir-ignored" id="ignoredList"></div>
+      </details>
     </section>
 
     <section class="groups" id="groupList" aria-live="polite"></section>

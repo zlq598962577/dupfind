@@ -9,6 +9,8 @@
   const state = {
     view: null,
     status: "all",
+    category: "user",
+    disposal: "pending",
     search: "",
     minSavings: 0,
     keep: "shortest",
@@ -18,17 +20,25 @@
     taskId: null,
     pollTimer: null,
     volumes: [],
-    confirmThreshold: { files: 20, bytes: 1 << 30 },
+    confirmThreshold: { files: 20, bytes: 1 << 30, groups: 100 },
     reportStale: false,
     disposalTaskId: null,
     disposalTimer: null,
     lastDisposal: null,
+    userCategories: new Set(["image", "video", "audio", "document", "archive", "installer", "font", "other"]),
+    categoryLabels: {},
+    ignorePath: "",
   };
+
+  // 报告加载请求序号：忽略/处置后的多次 reloadReport 可能乱序返回，
+  // 旧响应绝不能覆盖新视图
+  let loadSeq = 0;
 
   const STATUS_TEXT = { confirmed: "确认", suspect: "疑似", shared: "硬链接" };
   const PHASE_TEXT = { scanning: "遍历中", grouping: "分组中", verifying: "内容校验中", done: "完成" };
   const KEEP_TEXT = { shortest: "最短名称", newest: "最新修改" };
   const DISPOSAL_PHASE_TEXT = { planning: "准备中", applying: "移动中", restoring: "还原中", emptying: "清空中", done: "完成" };
+  const DISPOSAL_TEXT = { pending: "待处理", handled: "已处置", partial: "部分处置", ignored: "已忽略" };
   // 弹窗标题只说明「在做什么」，状态由 #disposalPhase 表达，避免完成后标题还停在「移动中」
   const DISPOSAL_TITLE_TEXT = { apply: "移入隔离区", restore: "还原", empty: "清空隔离区" };
 
@@ -64,6 +74,14 @@
     if (Number.isNaN(date.getTime())) return iso;
     const pad = (n) => String(n).padStart(2, "0");
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function formatDuration(ms) {
+    const seconds = Math.max(0, Math.round(Number(ms) / 1000));
+    if (seconds < 60) return `${seconds} 秒`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `约 ${minutes} 分钟`;
+    return `约 ${(minutes / 60).toFixed(1)} 小时`;
   }
 
   let toastTimer = null;
@@ -336,6 +354,8 @@
 
   function resetFilters() {
     state.status = "all";
+    state.category = "user";
+    state.disposal = "pending";
     state.search = "";
     state.minSavings = 0;
     state.visible = PAGE_SIZE;
@@ -346,7 +366,15 @@
     document.querySelectorAll("#statusFilter .segment").forEach((button) => {
       button.classList.toggle("active", button.dataset.status === "all");
     });
+    syncSegment("#typeFilter", "category", state.category);
+    syncSegment("#disposalFilter", "disposal", state.disposal);
     updateActionBar();
+  }
+
+  function syncSegment(selector, dataKey, value) {
+    document.querySelectorAll(`${selector} .segment`).forEach((button) => {
+      button.classList.toggle("active", button.dataset[dataKey] === value);
+    });
   }
 
   function setReportMeta(view) {
@@ -377,6 +405,59 @@
     document.querySelectorAll("#statusFilter [data-count]").forEach((node) => {
       node.textContent = counts[node.dataset.count] != null ? counts[node.dataset.count] : 0;
     });
+
+    const disposal = summary.disposal || {};
+    const disposalCounts = {
+      // 部分处置的组仍可继续处置，归入「待处理」，靠卡片徽章区分
+      pending: (disposal.pending || 0) + (disposal.partial || 0),
+      handled: disposal.handled || 0,
+      ignored: disposal.ignored || 0,
+      disposalAll: summary.groups || 0,
+    };
+    document.querySelectorAll("#disposalFilter [data-count]").forEach((node) => {
+      const value = disposalCounts[node.dataset.count];
+      node.textContent = value != null ? value : 0;
+    });
+
+    const typeCounts = { user: summary.userGroups || 0, typeAll: summary.groups || 0 };
+    document.querySelectorAll("#typeFilter [data-count]").forEach((node) => {
+      const value = typeCounts[node.dataset.count];
+      node.textContent = value != null ? value : 0;
+    });
+  }
+
+  function updateBanners(view) {
+    const summary = view.summary || {};
+    const hidden = summary.hiddenByTypeGroups || 0;
+    if (hidden > 0 && state.category === "user") {
+      $("typeBannerText").textContent = `当前只显示用户文件，已隐藏 ${hidden} 组代码 / 配置 / 程序类文件（共 ${summary.groups} 组）`;
+      $("typeBanner").hidden = false;
+    } else {
+      $("typeBanner").hidden = true;
+    }
+
+    const disposal = summary.disposal || {};
+    const handled = disposal.handled || 0;
+    const partial = disposal.partial || 0;
+    const ignored = disposal.ignored || 0;
+    if (handled + partial + ignored > 0) {
+      $("stateBannerText").textContent = `已处置 ${handled} 组 · 部分处置 ${partial} 组 · 已忽略 ${ignored} 组`;
+      $("stateBanner").hidden = false;
+    } else {
+      $("stateBanner").hidden = true;
+    }
+  }
+
+  function groupMatchesCategory(group) {
+    if (state.category === "all") return true;
+    return state.userCategories.has(group.category);
+  }
+
+  function groupMatchesDisposal(group) {
+    const value = group.disposalState || "pending";
+    if (state.disposal === "all") return true;
+    if (state.disposal === "pending") return value === "pending" || value === "partial";
+    return value === state.disposal;
   }
 
   function filteredGroups() {
@@ -384,9 +465,156 @@
     const keyword = state.search.trim().toLowerCase();
     return state.view.groups.filter((group) => {
       if (state.status !== "all" && group.status !== state.status) return false;
+      if (!groupMatchesCategory(group)) return false;
+      if (!groupMatchesDisposal(group)) return false;
       if (group.savingsBytes < state.minSavings) return false;
       if (!keyword) return true;
       return group.files.some((file) => file.path.toLowerCase().includes(keyword) || file.name.toLowerCase().includes(keyword));
+    });
+  }
+
+  function setCategory(value) {
+    state.category = value;
+    state.visible = PAGE_SIZE;
+    syncSegment("#typeFilter", "category", value);
+    pruneSelection();
+    render();
+  }
+
+  function setDisposal(value) {
+    state.disposal = value;
+    state.visible = PAGE_SIZE;
+    syncSegment("#disposalFilter", "disposal", value);
+    pruneSelection();
+    render();
+  }
+
+  /** 勾选当前筛选结果中所有可处置的组；limit 用于「释放最多的 100 组」。 */
+  function selectFiltered(limit) {
+    if (!state.view) return;
+    // 先过滤再截断：已处置/已忽略/非确认组不能占用「前 N 组」的名额，
+    // 否则点「释放最多的 100 组」可能只勾到 95 组甚至 0 组
+    const pool = filteredGroups().filter(isDisposable);
+    const targets = limit ? pool.slice(0, limit) : pool;
+    let added = 0;
+    targets.forEach((group) => {
+      if (!state.selected.has(group.id)) {
+        state.selected.add(group.id);
+        added += 1;
+      }
+    });
+    render();
+    if (added === 0) {
+      toast("当前筛选结果里没有可勾选的组（确认组、未处置、未忽略）");
+    } else {
+      toast(`已勾选 ${added} 组`);
+    }
+  }
+
+  function applyMinSavingsPreset() {
+    // 一键「只看大件」：设 1MB 阈值后勾选全部筛选结果，省掉「先输入再全选」两步
+    $("minSavingsInput").value = "1MB";
+    state.minSavings = 1024 * 1024;
+    state.visible = PAGE_SIZE;
+    pruneSelection();
+    render();
+    selectFiltered(null);
+  }
+
+  // ---------- 忽略清单 ----------
+
+  async function reloadReport(options) {
+    if (!state.view) return;
+    await loadReport(state.view.reportPath, Object.assign({ silent: true, keepFilters: true }, options));
+  }
+
+  async function addIgnoredDir(path) {
+    try {
+      const result = await api("/api/ignore", { method: "POST", body: { path } });
+      state.ignorePath = result.path || state.ignorePath;
+      toast(`已忽略目录：${path}（之后的扫描也会跳过）`);
+      await reloadReport();
+    } catch (error) {
+      toast(`忽略失败：${error.message}`, true);
+    }
+  }
+
+  async function removeIgnoredDir(path) {
+    try {
+      const result = await api(`/api/ignore?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+      state.ignorePath = result.path || state.ignorePath;
+      toast(`已取消忽略：${path}`);
+      await reloadReport();
+    } catch (error) {
+      toast(`取消失败：${error.message}`, true);
+    }
+  }
+
+  async function setGroupState(groupId, nextState) {
+    if (!state.view) return;
+    try {
+      await api("/api/report/state", {
+        method: "POST",
+        body: { reportPath: state.view.reportPath, groupId, state: nextState },
+      });
+      toast(nextState === "ignored" ? `第 ${groupId} 组已忽略` : `第 ${groupId} 组已恢复为待处理`);
+      await reloadReport();
+    } catch (error) {
+      toast(`状态更新失败：${error.message}`, true);
+    }
+  }
+
+  function renderDirectoryPanel(view) {
+    const panel = $("dirPanel");
+    const topDirs = view.topDirs || [];
+    const ignored = (view.ignore && view.ignore.directories) || [];
+    if (topDirs.length === 0 && ignored.length === 0) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+
+    const list = $("dirList");
+    list.replaceChildren();
+    const header = el("div", "dir-row dir-head");
+    header.append(el("span", "dir-name", "目录"), el("span", "dir-meta", "规模"), el("span", "dir-actions", ""));
+    list.append(header);
+
+    topDirs.forEach((entry) => {
+      const row = el("div", "dir-row");
+      row.append(el("span", "dir-name", entry.dir));
+      const meta = el("span", "dir-meta");
+      meta.append(document.createTextNode(`${entry.groups} 组 · 可节省 ${formatBytes(entry.savingsBytes)}`));
+      if (entry.suggestIgnore) meta.append(el("span", "tag tag-suggest", "建议忽略"));
+      row.append(meta);
+      const actions = el("span", "dir-actions");
+      // 盘符根不能加入忽略清单（会连整个卷一起排除），按钮直接不出现
+      if (!/^[A-Za-z]:\\?$/.test(entry.path || "")) {
+        actions.append(actionButton(entry.suggestIgnore ? "忽略此目录" : "忽略", () => addIgnoredDir(entry.path)));
+      }
+      row.append(actions);
+      list.append(row);
+    });
+
+    const ignoredList = $("ignoredList");
+    ignoredList.replaceChildren();
+    ignoredList.hidden = ignored.length === 0;
+    if (ignored.length === 0) return;
+    ignoredList.append(el("h4", null, `已忽略的目录（${ignored.length}）`));
+    ignored.forEach((entry) => {
+      const row = el("div", "dir-row dir-ignored-row");
+      row.append(el("span", "dir-name", entry.path));
+      row.append(
+        el(
+          "span",
+          "dir-meta",
+          entry.groups ? `${entry.groups} 组 · 隐藏 ${formatBytes(entry.savingsBytes)}` : "当前报告中没有命中"
+        )
+      );
+      const actions = el("span", "dir-actions");
+      actions.append(actionButton("取消忽略", () => removeIgnoredDir(entry.path), "ghost-btn small"));
+      row.append(actions);
+      ignoredList.append(row);
     });
   }
 
@@ -425,8 +653,13 @@
     return table;
   }
 
-  /** 该组是否可勾选处置：只有确认组、且存在可移动的物理簇。 */
+  /** 该组是否可勾选处置：确认组、存在多个物理簇、且尚未被处置/忽略。
+   *
+   * 「部分处置」仍可继续勾选：组里还有剩余副本要清。
+   */
   function isDisposable(group) {
+    const disposalState = group.disposalState || "pending";
+    if (disposalState === "handled" || disposalState === "ignored") return false;
     return group.status === "confirmed" && group.physicalCount >= 2;
   }
 
@@ -482,9 +715,22 @@
     updateActionBar();
   }
 
+  function actionButton(label, handler, className) {
+    const btn = el("button", className || "secondary-btn small", label);
+    btn.type = "button";
+    btn.addEventListener("click", (event) => {
+      event.stopPropagation();
+      handler();
+    });
+    return btn;
+  }
+
   function buildGroup(group) {
     const card = el("article", "group");
     card.dataset.status = group.status;
+    const disposalState = group.disposalState || "pending";
+    card.dataset.disposal = disposalState;
+    if (disposalState === "handled" || disposalState === "ignored") card.classList.add("disposed");
 
     const head = el("button", "group-head");
     head.type = "button";
@@ -505,6 +751,10 @@
     }
 
     head.append(el("span", `badge badge-${group.status}`, STATUS_TEXT[group.status] || group.status));
+    head.append(el("span", "tag tag-category", state.categoryLabels[group.category] || group.category));
+    if (disposalState !== "pending") {
+      head.append(el("span", `badge badge-${disposalState}`, DISPOSAL_TEXT[disposalState] || disposalState));
+    }
 
     const main = el("span", "group-main");
     main.append(el("span", "group-title", `${group.files.length} 个文件 · 每个 ${formatBytes(group.size)}`));
@@ -534,7 +784,11 @@
 
     const keepPath = Object.prototype.hasOwnProperty.call(group.keepers || {}, state.keep) ? group.keepers[state.keep] : null;
     const note = el("p", "note");
-    if (keepPath) {
+    if (disposalState === "handled") {
+      note.textContent = "该组已处置：文件已在隔离区，清空隔离区后才真正释放空间。";
+    } else if (disposalState === "ignored") {
+      note.textContent = "该组已被忽略，不会进入批量处置；点「恢复为待处理」可撤销。";
+    } else if (keepPath) {
       note.textContent = `按“${KEEP_TEXT[state.keep]}”策略将保留：${keepPath}（可切换上方“保留策略”）`;
     } else if (group.status === "shared") {
       note.textContent = "该组为硬链接，不占用额外空间，无需处置。";
@@ -542,6 +796,27 @@
       note.textContent = "该组没有可移动的重复文件（硬链接或不稳定），无需处置。";
     }
     body.append(note);
+
+    if (group.disposal) {
+      const record = group.disposal;
+      const parts = [DISPOSAL_TEXT[disposalState] || disposalState];
+      if (record.handledAt) parts.push(formatTime(record.handledAt));
+      if (record.movedFiles) parts.push(`移动 ${record.movedFiles} 个文件 · ${formatBytes(record.movedBytes || 0)}`);
+      body.append(el("p", "note disposal-note", `处置记录：${parts.join(" · ")}`));
+    }
+    if (group.ignoredFiles > 0) {
+      body.append(
+        el("p", "note", `另有 ${group.ignoredFiles} 个副本位于已忽略的目录，未计入可节省空间，也不会被处置。`)
+      );
+    }
+
+    const actions = el("div", "group-actions");
+    if (disposalState === "ignored") {
+      actions.append(actionButton("恢复为待处理", () => setGroupState(group.id, "pending")));
+    } else if (disposalState !== "handled") {
+      actions.append(actionButton("忽略此组", () => setGroupState(group.id, "ignored")));
+    }
+    if (actions.children.length > 0) body.append(actions);
 
     head.addEventListener("click", () => {
       const open = !state.openGroups.has(group.id);
@@ -577,6 +852,8 @@
     }
 
     $("toolbar").hidden = false;
+    updateBanners(state.view);
+    renderDirectoryPanel(state.view);
     const groups = filteredGroups();
     $("resultCount").textContent = `${groups.length} 组`;
 
@@ -587,7 +864,8 @@
     $("emptyState").hidden = !empty;
     if (empty) {
       $("emptyState").querySelector("h3").textContent = "没有匹配的分组";
-      $("emptyState").querySelector("p").textContent = "试试放宽状态筛选、关键词或最小可节省空间。";
+      $("emptyState").querySelector("p").textContent =
+        "试试切换处置状态 / 类型、放宽结论筛选，或调低最小可节省空间。";
     }
     $("loadMoreWrap").hidden = groups.length <= state.visible;
     $("loadMoreBtn").textContent = `加载更多（剩余 ${Math.max(0, groups.length - state.visible)} 组）`;
@@ -602,20 +880,35 @@
       return;
     }
     $("loadReportBtn").disabled = true;
+    const seq = ++loadSeq;
     try {
       const view = await api(`/api/report?path=${encodeURIComponent(target)}`);
+      if (seq !== loadSeq) return; // 已有更新的加载请求，旧响应直接丢弃
       const previousPath = state.view && state.view.reportPath;
       state.view = view;
       state.reportStale = false;
+      if (view.categoryLabels) state.categoryLabels = view.categoryLabels;
+      if (Array.isArray(view.userCategories) && view.userCategories.length > 0) {
+        state.userCategories = new Set(view.userCategories);
+      }
+      if (view.ignore && view.ignore.path) state.ignorePath = view.ignore.path;
       if (!opts.keepFilters && previousPath !== view.reportPath) resetFilters();
       $("reportPathInput").value = view.reportPath;
       setReportMeta(view);
       setSummary(summaryFromView(view));
       updateCounts(view);
       render();
-      toast(`已加载 ${view.summary.groups} 组：确认 ${view.summary.confirmedGroups} · 疑似 ${view.summary.suspectGroups} · 硬链接 ${view.summary.sharedGroups}`);
+      if (!opts.silent) {
+        toast(
+          `已加载 ${view.summary.groups} 组：确认 ${view.summary.confirmedGroups} · 疑似 ${view.summary.suspectGroups} · 硬链接 ${view.summary.sharedGroups}` +
+            (view.summary.ignoredGroups ? ` · 已忽略目录隐藏 ${view.summary.ignoredGroups} 组` : "")
+        );
+        if (view.state && view.state.identityOk === false) {
+          toast("报告已重新扫描，旧的处置记录不再适用，相关组已回到待处理", true);
+        }
+      }
     } catch (error) {
-      toast(`加载报告失败：${error.message}`, true);
+      if (seq === loadSeq) toast(`加载报告失败：${error.message}`, true);
     } finally {
       $("loadReportBtn").disabled = false;
     }
@@ -685,6 +978,7 @@
           keep: state.keep,
           trash: trashForView(),
           minSavings: $("minSavingsInput").value.trim() || "0",
+          verifyContent: $("verifyContentInput").checked,
         },
       });
       showPreview(preview, ids);
@@ -705,6 +999,33 @@
     nodes.push(previewNode("保留策略", KEEP_TEXT[preview.keepMode] || preview.keepMode));
     nodes.push(previewNode("隔离区", preview.trash));
     nodes.push(previewNode("说明", "文件先移入隔离区，磁盘空间要清空隔离区后才释放"));
+    if (preview.estimatedSeconds > 0) {
+      nodes.push(previewNode("预计耗时", formatDuration(preview.estimatedSeconds * 1000)));
+    }
+
+    if (preview.missingFiles > 0) {
+      nodes.push(
+        el(
+          "p",
+          "hint warn-text",
+          `有 ${preview.missingFiles} 个待移动文件已不在磁盘上（可能被其他程序移动或删除），它们会被跳过，不影响其余文件。`
+        )
+      );
+    }
+
+    if (preview.skippedByReason && preview.skippedByReason.length > 0) {
+      const block = el("div", "preview-block");
+      block.append(el("h3", null, "未纳入处置的组"));
+      const table = el("div", "preview-table");
+      preview.skippedByReason.forEach((item) => {
+        const line = el("div", "preview-line");
+        line.append(el("span", "preview-key", item.reason));
+        line.append(el("span", "preview-num", `${item.groups} 组`));
+        table.append(line);
+      });
+      block.append(table);
+      nodes.push(block);
+    }
 
     nodes.push(previewTable("按目录", preview.byDirectory, "directory"));
     nodes.push(previewTable("按扩展名", preview.byExtension, "extension"));
@@ -785,6 +1106,7 @@
           keep: state.keep,
           trash: trashForView(),
           minSavings: $("minSavingsInput").value.trim() || "0",
+          verifyContent: $("verifyContentInput").checked,
           confirm,
         },
       });
@@ -811,7 +1133,38 @@
     $("disposalBar").firstElementChild.style.width = "0%";
     $("disposalStats").replaceChildren();
     $("progressFoot").replaceChildren();
+    if (kind === "apply") {
+      const stop = el("button", "secondary-btn", "停止");
+      stop.type = "button";
+      stop.id = "stopDisposalBtn";
+      stop.addEventListener("click", cancelDisposal);
+      $("progressFoot").append(stop);
+    }
     $("progressModal").hidden = false;
+  }
+
+  async function cancelDisposal() {
+    const taskId = state.disposalTaskId;
+    const button = $("stopDisposalBtn");
+    if (!taskId) return;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "停止中…";
+    }
+    try {
+      const result = await api(`/api/disposal/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+      if (result.cancelled) {
+        $("disposalPhase").textContent = "正在停止…（当前组完成后生效）";
+      } else {
+        toast("任务已经结束，无需停止");
+      }
+    } catch (error) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = "停止";
+      }
+      toast(`停止失败：${error.message}`, true);
+    }
   }
 
   function renderDisposalProgress(task) {
@@ -840,6 +1193,11 @@
       node.append(bold);
       stats.append(node);
     });
+    if (isApply && task.state === "running" && done > 0 && total > done && task.durationMs > 0) {
+      // 用已完成的平均速度外推；组间大小差异会让它不准，但总比「0/500 组」没有预期好
+      const remaining = Math.round((task.durationMs / done) * (total - done));
+      stats.append(el("span", "hint", `预计剩余 ${formatDuration(remaining)}`));
+    }
   }
 
   function pollDisposal(taskId, attempt) {
@@ -855,7 +1213,7 @@
           pollDisposal(taskId, 0);
           return;
         }
-        finishDisposal(task);
+        await finishDisposal(task);
       } catch (error) {
         // 服务端任务很可能还在跑：不能立刻关掉进度框、丢掉任务 id，否则用户
         // 以为失败、再点一次就会对同一隔离区并发启动第二个 apply（后端现在会
@@ -883,7 +1241,7 @@
     }, POLL_INTERVAL);
   }
 
-  function finishDisposal(task) {
+  async function finishDisposal(task) {
     state.disposalTaskId = null;
     state.lastDisposal = task;
     const foot = $("progressFoot");
@@ -891,18 +1249,20 @@
     const movedAnything = task.movedFiles > 0;
     if (task.state === "failed") {
       $("disposalPhase").textContent = "失败";
-      const message = el("p", "hint error-text", task.error || task.message || "未知错误");
-      $("disposalStats").append(message);
+      $("disposalStats").append(el("p", "hint error-text", task.error || task.message || "未知错误"));
     } else {
-      $("disposalPhase").textContent = task.message || "完成";
+      $("disposalPhase").textContent = task.state === "cancelled" ? "已停止" : task.message || "完成";
       $("disposalBar").firstElementChild.style.width = "100%";
-      if (task.kind === "apply") {
-        toast(`已移动 ${task.movedFiles} 个文件到隔离区（清空后才释放空间）`);
-      } else if (task.kind === "restore") {
-        toast("已从隔离区还原");
-      } else {
-        toast("隔离区已清空");
-      }
+    }
+
+    if (task.kind === "apply" && !task.stateWritten) {
+      $("disposalStats").append(
+        el(
+          "p",
+          "hint error-text",
+          "处置状态未能写入磁盘：下次加载报告时这些组可能仍显示为待处理，可在卡片上手动标记「已忽略」修正。"
+        )
+      );
     }
 
     const close = el("button", "secondary-btn", "关闭");
@@ -927,24 +1287,32 @@
       foot.append(purge);
     }
 
-    if (task.kind === "apply" && movedAnything) {
-      // 处置后报告里的路径已不再反映磁盘现状；不重新扫描的话，再勾同一组
-      // 只会「成功移动 0 个文件」。明确告诉用户，并把这份报告标记为过期。
-      if (state.view) {
-        $("reportMeta").classList.add("stale");
-      }
-      state.view = null;
-      state.reportStale = true;
+    if (task.kind === "apply") {
+      if (movedAnything) toast(`已移动 ${task.movedFiles} 个文件到隔离区（清空后才释放空间）`);
       state.selected.clear();
-      // 汇总栏的数字来自已过期的报告，留着会让人以为「还有 2 组 99.6 KB 可清理」
-      resetSummary();
-      $("metaRoot").textContent = "—";
-      $("metaPath").textContent = "—";
-      $("metaHash").textContent = "—";
-      render();
+      // 报告不再「过期」：处置结果已写进 <报告>.state.json / manifest，
+      // 重新加载后这些组会带着处置记录出现，而不是又重新冒出来。
+      if (state.view) {
+        await reloadReport({ keepFilters: true });
+        if (task.remainingGroupIds && task.remainingGroupIds.length > 0) {
+          toast(`${task.remainingGroupIds.length} 组仍未处理，可继续勾选处置`);
+        }
+      }
       return;
     }
 
+    if (task.kind === "restore") {
+      // 失败原因已经写在弹窗里；不能再提示「已还原」，否则用户会以为文件
+      // 回到了原位，实际还在隔离区
+      if (task.state === "failed") return;
+      toast(task.message || "已从隔离区还原");
+      // 还原会撤销对应组的「已处置」标记（sync_after_restore），视图要跟着更新
+      if (state.view) await reloadReport({ keepFilters: true });
+      return;
+    }
+
+    if (task.state === "failed") return;
+    toast(task.message || "隔离区已清空");
     state.selected.clear();
     render();
     updateActionBar();
@@ -1042,6 +1410,7 @@
         $("minSizeInput").value = meta.defaults.minSize;
       }
       if (meta.confirmThreshold) state.confirmThreshold = meta.confirmThreshold;
+      if (meta.ignorePath) state.ignorePath = meta.ignorePath;
       $("serverPill").textContent = `dupfind ${meta.version || ""} · 本地`.replace("  ·", " ·");
       if (meta.lastReport) {
         $("reportPathInput").value = meta.lastReport;
@@ -1075,6 +1444,20 @@
       pruneSelection();
       render();
     });
+
+    $("disposalFilter").addEventListener("click", (event) => {
+      const button = event.target.closest(".segment");
+      if (button) setDisposal(button.dataset.disposal);
+    });
+
+    $("typeFilter").addEventListener("click", (event) => {
+      const button = event.target.closest(".segment");
+      if (button) setCategory(button.dataset.category);
+    });
+
+    $("typeShowAllBtn").addEventListener("click", () => setCategory("all"));
+    $("stateShowHandledBtn").addEventListener("click", () => setDisposal("handled"));
+    $("stateShowIgnoredBtn").addEventListener("click", () => setDisposal("ignored"));
 
     let searchTimer = null;
     $("searchInput").addEventListener("input", (event) => {
@@ -1111,6 +1494,9 @@
     });
 
     $("selectPageBtn").addEventListener("click", selectVisible);
+    $("selectAllBtn").addEventListener("click", () => selectFiltered(null));
+    $("selectTop100Btn").addEventListener("click", () => selectFiltered(100));
+    $("minSavingsPresetBtn").addEventListener("click", applyMinSavingsPreset);
     $("clearSelectionBtn").addEventListener("click", () => {
       state.selected.clear();
       render();
