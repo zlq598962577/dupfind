@@ -181,11 +181,16 @@ def test_restore_clears_handled_but_keeps_ignored(scan):
     record_apply_result(document, {2: ("handled", 1, SIZE)})
     set_manual_group_state(document, 1, "ignored")
 
-    sync_after_restore(scan["report"], str(scan["trash"]))
+    assert sync_after_restore(scan["report"], str(scan["trash"])) is True
 
     state = load_effective_state(document, trash=str(scan["trash"]))
     assert state.state_of(1) == "ignored", "手动忽略不能被还原流程抹掉"
     assert state.state_of(2) == "pending", "还原后该组必须回到待处理"
+
+
+def test_sync_after_restore_reports_missing_report(scan, tmp_path):
+    """报告不可读时返回 False，让还原任务能提示「状态可能仍是旧的」。"""
+    assert sync_after_restore(tmp_path / "missing.json", str(scan["trash"])) is False
 
 
 def test_manual_pending_overrides_manifest_backfill(scan):
@@ -262,3 +267,18 @@ def test_report_identity_uses_scan_metadata(scan):
     assert identity["root"] == str(Path(scan["report"]).parent)
     assert identity["groups"] == 2
     assert identity["filesScanned"] == 4
+
+
+def test_sync_after_restore_rejects_relative_report(scan):
+    """相对 report 不能被按 CWD 解析后改写其他报告的状态。"""
+    assert sync_after_restore("report.json", str(scan["trash"])) is False
+
+
+def test_sync_after_restore_rejects_rescanned_report(scan):
+    document = load_report(scan["report"])
+    record_apply_result(document, {1: ("handled", 1, SIZE)})
+    payload = json.loads(scan["report"].read_text(encoding="utf-8"))
+    payload["scan"]["startedAt"] = "2026-09-09T09:09:09+08:00"
+    scan["report"].write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert sync_after_restore(scan["report"], str(scan["trash"])) is False

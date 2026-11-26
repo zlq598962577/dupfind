@@ -23,8 +23,8 @@ from typing import Any
 from .console import say
 from .jsonio import read_json, write_json_atomic
 from .models import FILE_ATTRIBUTE_REPARSE_POINT
-from .safety import canonical, protected_reason
-from .trash import TrashError, validate_source_path
+from .safety import CanonicalCache, canonical, protected_reason
+from .trash import TrashError, relative_to_drive, validate_source_path
 from .units import format_size, iso_now
 from .win32 import long_path, move_file, remove_file, strip_long_prefix
 
@@ -87,6 +87,11 @@ class ManifestDocument:
 class RestoreOptions:
     dry_run: bool = True
     on_conflict: str = "skip"
+    #: 只处理 ``report`` 字段与该路径匹配的 manifest（绝对路径比较）。
+    report: str | None = None
+    #: 只处理这些组；``None`` 表示不限制。跨报告组号不唯一，调用方必须
+    #: 同时给出 ``report``，否则可能还原另一份报告的同号组。
+    group_ids: frozenset[int] | None = None
 
 
 @dataclass(slots=True)
@@ -96,6 +101,20 @@ class RestoreStats:
     skipped: int = 0
     failed: int = 0
     missing: int = 0
+    #: ``restored`` 中「原位置已有文件、隔离区已无文件」的幂等命中；预览
+    #: 用 ``restored - already_restored`` 表示真正会移动的文件数。
+    already_restored: int = 0
+    #: 因报告过滤 / 组过滤跳过的 manifest 与动作数量。
+    filtered_manifests: int = 0
+    filtered_actions: int = 0
+    #: 指定报告过滤时，读不出来且被跳过的 manifest 数量。
+    unreadable_manifests: int = 0
+    #: manifest 写回失败（文件已还原，但记录仍停在 completed）。
+    persist_failures: int = 0
+    #: 还原完成后状态文件是否同步成功。失败不影响文件已经还原的事实，
+    #: 但调用方要据此提示「页面上的处置状态可能还是旧的」。
+    state_synced: bool = True
+    sync_errors: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -161,7 +180,9 @@ def _collect_journal(path: Path) -> dict[tuple[str, str], Action]:
     result: dict[tuple[str, str], Action] = {}
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # 崩溃/磁盘满可能把多字节序列截断，留下非法 UTF-8。按「这份记录
+        # 读不出来」处理，让上层按报告过滤时能跳过，而不是让预览/执行 500。
         return result
     for line in text.splitlines():
         line = line.strip()
@@ -244,24 +265,35 @@ def _norm(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
-def _is_inside(child: str, parent: str) -> bool:
+def _is_inside(child: str, parent: str, cache: CanonicalCache | None = None) -> bool:
     """基于规约后的真实路径判断包含关系。
 
     只用字符串比较不够：trash 内部若有一个指向外部的 junction，字符串上
     仍「在 trash 内」，实际文件却在别处。``canonical`` 会解析 8.3 短名并
     规范化，因此能发现大部分伪装。
+
+    批量预览传入 ``CanonicalCache``：同一隔离区/父目录只解析一次，避免
+    每个动作都付 realpath 的成本。
     """
     try:
-        return ntpath.commonpath([canonical(child), canonical(parent)]) == canonical(parent)
+        if cache is not None:
+            child_key = cache.canonical(child)
+            parent_key = cache.canonical(parent)
+        else:
+            child_key = canonical(child)
+            parent_key = canonical(parent)
+        return ntpath.commonpath([child_key, parent_key]) == parent_key
     except ValueError:
         return False
 
 
-def _validate_action(action: Action, trash: str) -> str | None:
+def _validate_action(
+    action: Action, trash: str, *, cache: CanonicalCache | None = None
+) -> str | None:
     """还原前校验：源/目标都是本地绝对路径，且 dst 必须位于 trash 内。
 
     还原会往 ``src`` 写文件，因此 ``src`` 也不能落在系统保护范围内 —— 合法
-    manifest 里不会有这种动作（apply 从不移动受保护路径的文件），出现即伪造。
+    manifest 里不会有这种动作（apply 从不移动受保护文件），出现即伪造。
     """
     for label, value in (("src", action.src), ("dst", action.dst)):
         try:
@@ -271,12 +303,75 @@ def _validate_action(action: Action, trash: str) -> str | None:
     reason = protected_reason(action.src)
     if reason is not None:
         return f"src 位于受保护路径（{reason}），拒绝写入"
-    if not _is_inside(action.dst, trash):
+    if not _is_inside(action.dst, trash, cache):
         return "dst 不在该 manifest 的 trash 目录内"
+    if not _mirrors_source(action.src, action.dst, trash):
+        return "dst 与 src 不构成隔离区镜像路径（manifest 可能被伪造）"
     # 沿路径检查每一级是否重解析点：字符串在 trash 内、实际经 junction 指向外部
     if _crosses_reparse_point(action.dst, trash):
         return "dst 路径经过符号链接/junction，拒绝还原"
     return None
+
+
+def _mirror_relative(letter: str, relative: str, dst: str, trash: str) -> bool:
+    try:
+        actual = ntpath.relpath(ntpath.normpath(dst), ntpath.normpath(trash))
+    except ValueError:
+        return False
+    parts = [part for part in actual.replace("/", "\\").split("\\") if part]
+    if len(parts) < 2 or parts[0].upper() != letter:
+        return False
+    actual_relative = ntpath.normpath("\\".join(parts[1:]))
+    if ntpath.normcase(actual_relative) == ntpath.normcase(relative):
+        return True
+    # 同名冲突时 apply 只改最后一段文件名：<stem>.dupfind-<n><ext>。
+    # 无扩展名文件（LICENSE -> LICENSE.dupfind-1）的 splitext 会把
+    # ".dupfind-1" 当成扩展名，所以不能用 actual 的 splitext 反推。
+    if ntpath.normcase(ntpath.dirname(actual_relative)) != ntpath.normcase(ntpath.dirname(relative)):
+        return False
+    stem, extension = ntpath.splitext(ntpath.basename(relative))
+    prefix = ntpath.normcase(f"{stem}.dupfind-")
+    suffix = ntpath.normcase(extension)
+    actual_name = ntpath.normcase(ntpath.basename(actual_relative))
+    if not actual_name.startswith(prefix):
+        return False
+    rest = actual_name[len(prefix) :]
+    if suffix:
+        if not rest.endswith(suffix):
+            return False
+        rest = rest[: -len(suffix)]
+    return rest.isdigit()
+
+
+def _mirrors_source(src: str, dst: str, trash: str) -> bool:
+    """dst 必须等于 ``<trash>\\<盘符>\\<src 相对路径>``（允许 ``.dupfind-N``）。
+
+    apply 的 ``TrashManager.target_for`` 只会生成这个形状。只校验「dst 在
+    trash 内」是不够的：一份伪造 manifest 可以把隔离区里其他批次/其他报告
+    的唯一副本写成某动作的 dst，再借「还原」把它搬到任意合法 src 上。
+
+    字符串比较成功时不走 canonical（上万文件时 realpath 太慢）；只有失败
+    才用 canonical 重试，兼容 8.3 短名等字符串别名。junction 是否放行仍由
+    ``_crosses_reparse_point`` 按真实路径判断，不由这里决定。
+    """
+    try:
+        letter, relative = relative_to_drive(src)
+    except TrashError:
+        return False
+    relative = ntpath.normpath(relative)
+    if _mirror_relative(letter, relative, dst, trash):
+        return True
+    try:
+        return _mirror_relative(letter, relative, canonical(dst), canonical(trash))
+    except (OSError, ValueError):
+        return False
+
+
+def validate_action(
+    action: Action, trash: str, *, cache: CanonicalCache | None = None
+) -> str | None:
+    """公开的只读校验：Web 预览与真实执行必须共用同一套安全判定。"""
+    return _validate_action(action, trash, cache=cache)
 
 
 def _crosses_reparse_point(path: str, root: str) -> bool:
@@ -332,19 +427,74 @@ def _move_back(src: str, dst: str, *, replace: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def run_restore(target: str | Path, options: RestoreOptions) -> int:
+def _absolute_report_key(value: str | None) -> str | None:
+    """把报告路径规约成可比较的绝对路径；相对路径一律返回 None。
+
+    旧版 manifest 的 report 可能是相对路径（d70aed0 之前 apply 原样保存
+    ``document.path``）。不能用 ``os.path.abspath`` 按当前进程 CWD 猜 ——
+    当时的 CWD 已经不可知，猜中同名文件会把这批「无法归属」的记录当成
+    目标报告的批次还原。
+    """
+    if not value:
+        return None
+    text = value.replace("/", "\\")
+    drive, _ = ntpath.splitdrive(text)
+    if not ntpath.isabs(text) or not drive:
+        return None
+    try:
+        return _norm(text)
+    except (OSError, ValueError):
+        return None
+
+
+def _manifest_matches_report(document: ManifestDocument, report: str) -> bool:
+    """manifest 的 report 字段是否指向这次要还原的报告（只接受绝对路径）。"""
+    left = _absolute_report_key(document.report)
+    right = _absolute_report_key(report)
+    return left is not None and right is not None and left == right
+
+
+def run_restore(
+    target: str | Path, options: RestoreOptions, stats: RestoreStats | None = None
+) -> int:
     if options.on_conflict not in CONFLICT_MODES:
         raise RestoreError(f"--on-conflict 必须是 {', '.join(CONFLICT_MODES)} 之一")
 
-    documents = [load_manifest(path) for path in discover_manifests(target)]
-    stats = RestoreStats()
+    stats = stats if stats is not None else RestoreStats()
+    # 用户显式指定单个 manifest 文件时，它读不出来就是参数/记录错误；
+    # 不能当成「其他报告批次」静默跳过，否则 CLI 会把损坏误报成「没事可做」。
+    target_is_dir = Path(target).is_dir()
+    documents: list[ManifestDocument] = []
+    for path in discover_manifests(target):
+        try:
+            documents.append(load_manifest(path))
+        except RestoreError:
+            # 按报告还原目录时，一份损坏的其他批次不应挡住宿主批次；整区
+            # 还原保持原语义：任何一份读不出来都在移动任何文件之前中止。
+            if options.report is None or not target_is_dir:
+                raise
+            stats.unreadable_manifests += 1
+            say(f"\nmanifest: {path}\n  跳过：无法读取。")
     touched: dict[str, str] = {}
 
     say(f"模式: {'dry-run（不移动）' if options.dry_run else '实际还原'}")
     for document in documents:
+        if options.report is not None and not _manifest_matches_report(document, options.report):
+            stats.filtered_manifests += 1
+            say(f"\nmanifest: {document.path}")
+            say("  跳过：report 与本次还原范围不匹配。")
+            continue
         say(f"\nmanifest: {document.path}")
         say(f"trash:    {document.trash}")
-        pending = document.restorable
+        restorable = document.restorable
+        # group 过滤只缩小「这次遍历哪些动作」，document.actions 保持完整：
+        # _persist 会把它整份写回，未选中的动作必须原样保留。
+        pending = [
+            action
+            for action in restorable
+            if options.group_ids is None or action.group_id in options.group_ids
+        ]
+        stats.filtered_actions += len(restorable) - len(pending)
         if not pending:
             say("  没有待还原的动作。")
             continue
@@ -363,16 +513,36 @@ def run_restore(target: str | Path, options: RestoreOptions) -> int:
         if changed:
             # 写回失败时不能同步状态：manifest 仍是 completed，同步会把刚
             # 还原的组重新标成已处置，下一次打开报告又是错的
-            if _persist(document) and document.report:
-                touched[document.report] = document.trash
+            if not _persist(document):
+                stats.persist_failures += 1
+                stats.state_synced = False
+                say("  [警告] manifest 写回失败，处置状态无法同步")
+            else:
+                report_key = _absolute_report_key(document.report)
+                if report_key is not None:
+                    touched[report_key] = document.trash
+                elif document.report:
+                    # 有来源但无法可靠解析（旧版相对路径）：状态不能同步，
+                    # 必须让调用方知道页面可能仍显示「已处置」。
+                    stats.state_synced = False
+                    say("  [警告] manifest 的 report 不是绝对路径，无法同步处置状态")
 
-    if touched:
+    if touched and stats.unreadable_manifests:
+        # 有 manifest 读不出来时，sync 重扫同样看不到它们，会把这些组当成
+        # 「没有 completed 动作」从状态里删掉，而文件仍在隔离区。宁可不更新
+        # 状态并明确告警。
+        stats.state_synced = False
+        say("  [警告] 有 manifest 无法读取，跳过状态同步以免误删处置记录")
+    elif touched:
         # 还原后这些组必须回到「待处理」，否则页面还说它们已处置，用户
         # 既不能再勾选、也看不到文件其实已经回来了。
         from .report_state import sync_after_restore
 
         for report_path, trash_dir in touched.items():
-            sync_after_restore(report_path, trash_dir)
+            if not sync_after_restore(report_path, trash_dir):
+                stats.state_synced = False
+                stats.sync_errors.append(report_path)
+                say(f"  [警告] 无法同步处置状态: {report_path}")
 
     say()
     prefix = "（dry-run：未移动任何文件）" if options.dry_run else ""
@@ -380,6 +550,15 @@ def run_restore(target: str | Path, options: RestoreOptions) -> int:
         f"完成：还原 {stats.restored} 个文件，{format_size(stats.restored_bytes)}；"
         f"跳过 {stats.skipped}，缺失 {stats.missing}，失败 {stats.failed} {prefix}".rstrip()
     )
+    if stats.already_restored:
+        say(f"其中 {stats.already_restored} 个文件原位置已存在（此前已经还原）")
+    if stats.filtered_manifests or stats.filtered_actions:
+        say(
+            f"过滤：{stats.filtered_manifests} 份 manifest、{stats.filtered_actions} 个动作"
+            "不在本次还原范围。"
+        )
+    if stats.unreadable_manifests:
+        say(f"警告：{stats.unreadable_manifests} 份 manifest 无法读取，已跳过。")
     # 退出码要能区分「失败」与「没事可做」，否则脚本无法判断
     if stats.failed:
         return 2
@@ -396,7 +575,14 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
     src_exists = os.path.exists(long_path(action.src))
     dst_exists = os.path.exists(long_path(action.dst))
     if src_exists and dst_exists and os.path.samefile(long_path(action.src), long_path(action.dst)):
-        # 同一物理文件（硬链接或已还原），无需移动
+        # 同一物理文件（硬链接或已还原），无需移动。completed 时仍要落盘
+        # restored 并触发状态同步，否则该组会永远停在「已处置」。
+        if action.status == "completed":
+            stats.restored += 1
+            stats.restored_bytes += action.size
+            stats.already_restored += 1
+            say(f"  [已在原处] {action.src}")
+            return "restored"
         stats.skipped += 1
         say(f"  [已是同一文件] {action.src}")
         return "skipped"
@@ -409,6 +595,7 @@ def _restore_one(action: Action, trash: str, options: RestoreOptions, stats: Res
             # completed，状态文件也就永远显示「已处置」，无法恢复为待处理。
             stats.restored += 1
             stats.restored_bytes += action.size
+            stats.already_restored += 1
             say(f"  [已还原] {action.src}")
             return "restored"
         # pending：只是登记了、移动根本没发生，没有可还原的动作

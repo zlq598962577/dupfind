@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -146,6 +147,22 @@ def client(tmp_path: Path):
     app = create_app(manager=manager, disposal=DisposalTaskManager())
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def _isolated_default_trash(monkeypatch, tmp_path, request):
+    """预览会扫描 <报告盘符>:\\_dupfind_trash；测试统一指到 tmp_path。
+
+    否则宿主机器上的历史隔离区会改变 unscoped/otherReport 计数，测试不再
+    hermetic（在临时目录位于 D 盘、而 D:\\_dupfind_trash 有残留时必现）。
+    专门验证 default_trash_for 本身的用例不受影响。
+    """
+    if request.node.name == "test_default_trash_for_uses_drive_root":
+        return
+    monkeypatch.setattr(
+        "dupfind.web.disposal.default_trash_for",
+        lambda root: str(tmp_path / "default-trash"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +632,481 @@ def test_apply_reports_moved_files_even_when_it_fails_midway(tmp_path, report_pa
     assert task.state == "failed"
     assert task.moved_files == 2, "失败时丢失了已移动的文件数"
     assert real_execute is not boom
+
+
+# ---------------------------------------------------------------------------
+# 还原范围：预览 / 按组还原 / 输入校验
+# ---------------------------------------------------------------------------
+
+
+def _apply_all(client, report_path: Path, trash: Path) -> dict:
+    response = client.post(
+        "/api/apply",
+        json={"reportPath": str(report_path), "keep": "shortest", "trash": str(trash), "confirm": True},
+    )
+    assert response.status_code == 200, response.text
+    task = _wait(client, response.json()["id"])
+    assert task["state"] == "succeeded", task
+    return task
+
+
+def _preview(client, report_path: Path, group_ids: list[int] | None = None):
+    params = [("reportPath", str(report_path))]
+    for group_id in group_ids or []:
+        params.append(("groupIds", str(group_id)))
+    return client.get("/api/restore/preview", params=params)
+
+
+def test_restore_preview_lists_disposed_groups(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    response = _preview(client, report_path)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["identityOk"] is True
+    assert preview["totalFiles"] == 3, "两组共移走 3 个文件"
+    assert preview["totalBytes"] == SIZE * 3
+    assert {item["groupId"] for item in preview["groups"]} == {1, 2}
+    usable = [item for item in preview["trashes"] if item["files"] > 0]
+    assert len(usable) == 1
+    assert os.path.normcase(usable[0]["path"]) == os.path.normcase(str(trash))
+
+
+def test_restore_preview_group_filter(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    response = _preview(client, report_path, [1])
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["totalFiles"] == 2, "组 1 只移走 2 个文件"
+    assert [item["groupId"] for item in preview["groups"]] == [1]
+
+
+def test_restore_group_endpoint_only_restores_selected_group(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    response = client.post(
+        "/api/restore",
+        json={
+            "trash": str(trash),
+            "reportPath": str(report_path),
+            "groupIds": [1],
+            "dryRun": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    task = _wait(client, response.json()["id"])
+    assert task["state"] == "succeeded", task
+    assert task["restoredFiles"] == 2
+    assert task["reportPath"] == str(report_path)
+
+    assert (data / "docs" / "报告 - 副本.pdf").is_file()
+    assert (data / "docs" / "报告 - 副本(2).pdf").is_file()
+    assert not (data / "pics" / "照片 - 副本.zip").exists(), "未选中的组被还原了"
+    assert any(
+        path.name == "照片 - 副本.zip" for path in trash.rglob("*") if path.is_file()
+    ), "未选中的组应留在隔离区"
+
+    view = client.get("/api/report", params={"path": str(report_path)}).json()
+    states = {group["id"]: group["disposalState"] for group in view["groups"]}
+    assert states[1] == "pending", "组级还原后该组应回到待处理"
+    assert states[2] == "handled", "未还原的组必须保持已处置"
+
+
+def test_restore_group_endpoint_requires_report_path(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    response = client.post(
+        "/api/restore", json={"trash": str(trash), "groupIds": [1], "dryRun": False}
+    )
+    assert response.status_code == 400
+    assert "reportPath" in response.json()["detail"]
+
+
+def test_restore_group_endpoint_rejects_unknown_group(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    response = client.post(
+        "/api/restore",
+        json={
+            "trash": str(trash),
+            "reportPath": str(report_path),
+            "groupIds": [999],
+            "dryRun": False,
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_restore_endpoint_rejects_file_as_trash(client, tmp_path):
+    fake = tmp_path / "not-a-trash.bin"
+    fake.write_bytes(b"x")
+    response = client.post("/api/restore", json={"trash": str(fake), "dryRun": False})
+    assert response.status_code == 404
+
+
+def test_restore_preview_rejects_rescanned_report(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["scan"]["startedAt"] = "2026-09-09T09:09:09+08:00"
+    report_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    response = _preview(client, report_path)
+    assert response.status_code == 409, response.text
+    assert "重新扫描" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 审查回归：journal-only、旧组号、报告级范围、幂等收尾
+# ---------------------------------------------------------------------------
+
+
+def test_restore_preview_reports_journal_only_as_unscoped(client, report_path, data, tmp_path):
+    """只剩 journal 的崩溃记录没有 report 字段，预览应归为「无法归属」而非不可读。
+
+    这类记录不在 Web 的报告级/组级范围里（无从判断属于哪份报告），但
+    ``dupfind restore <trash>`` 的整区还原仍能处理，必须提示用户走 CLI。
+    """
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    manifest = next(trash.glob("manifest-*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    journal = Path(str(manifest) + ".journal")
+    journal.write_text(
+        "\n".join(json.dumps(action, ensure_ascii=False) for action in payload["actions"]) + "\n",
+        encoding="utf-8",
+    )
+    manifest.unlink()
+
+    response = _preview(client, report_path)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert preview["totalFiles"] == 0
+    assert preview["unscopedManifests"] == 1
+    assert preview["totalUnreadable"] == 0, "journal-only 记录被误报为不可读"
+
+    # CLI 整区还原仍能把它捞回来
+    from dupfind.restore import RestoreOptions, run_restore
+
+    assert run_restore(trash, RestoreOptions(dry_run=False)) == 0
+    assert (data / "docs" / "报告 - 副本.pdf").is_file()
+
+
+def test_restore_preview_ignores_stale_group_from_state(client, report_path, data, tmp_path):
+    """状态里残留的旧组号不属于当前报告时不能索引报错。"""
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    state_path = Path(str(report_path) + ".state.json")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["groups"]["999"] = {
+        "state": "handled",
+        "handledAt": "",
+        "movedFiles": 1,
+        "movedBytes": SIZE,
+        "manifest": str(next(trash.glob("manifest-*.json"))),
+    }
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    response = _preview(client, report_path)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert 999 in preview["staleGroupIds"]
+    assert 999 not in preview["groupIds"]
+    assert preview["totalFiles"] == 3
+
+
+def test_restore_report_level_skips_ignored_group(client, report_path, data, tmp_path):
+    """报告级还原只能动 still handled/partial 的组，不能把 ignored 组的文件搬回来。"""
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    ignored = client.post(
+        "/api/report/state",
+        json={"reportPath": str(report_path), "groupId": 1, "state": "ignored"},
+    )
+    assert ignored.status_code == 200, ignored.text
+
+    response = client.post(
+        "/api/restore",
+        json={"trash": str(trash), "reportPath": str(report_path), "dryRun": False},
+    )
+    assert response.status_code == 200, response.text
+    task = _wait(client, response.json()["id"])
+    assert task["state"] == "succeeded", task
+    assert task["restoredFiles"] == 1, "只应还原仍为 handled 的组 2"
+    assert not (data / "docs" / "报告 - 副本.pdf").exists(), "ignored 组的文件被还原了"
+    assert (data / "pics" / "照片 - 副本.zip").is_file()
+
+
+def test_restore_report_level_skips_unsafe_group(client, report_path, data, tmp_path):
+    """预览标记 unsafe 的组不能被报告级执行还原。"""
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    manifest = next(trash.glob("manifest-*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    for action in payload["actions"]:
+        if action["groupId"] == 1:
+            action["src"] = str(tmp_path / "outside" / "moved.pdf")
+            break
+    manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    preview = _preview(client, report_path).json()
+    assert preview["unsafeGroupIds"] == [1]
+
+    response = client.post(
+        "/api/restore",
+        json={"trash": str(trash), "reportPath": str(report_path), "dryRun": False},
+    )
+    assert response.status_code == 200, response.text
+    task = _wait(client, response.json()["id"])
+    assert task["state"] == "succeeded", task
+    assert task["restoredFiles"] == 1
+    assert any(
+        path.name == "报告 - 副本.pdf" for path in trash.rglob("*") if path.is_file()
+    ), "unsafe 组的文件被还原了"
+
+
+def test_restore_group_endpoint_rejects_unsafe_group(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    manifest = next(trash.glob("manifest-*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    for action in payload["actions"]:
+        if action["groupId"] == 1:
+            action["src"] = str(tmp_path / "outside" / "moved.pdf")
+            break
+    manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    response = client.post(
+        "/api/restore",
+        json={
+            "trash": str(trash),
+            "reportPath": str(report_path),
+            "groupIds": [1],
+            "dryRun": False,
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_restore_group_endpoint_rejects_unverifiable_manifest(
+    client, report_path, data, tmp_path, monkeypatch
+):
+    """超过读取上限的 manifest 无法校验组归属，必须拒绝而不是静默跳过。"""
+    import dupfind.web.disposal as disposal_module
+
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    monkeypatch.setattr(disposal_module, "MAX_PREVIEW_MANIFEST_BYTES", 1)
+
+    response = client.post(
+        "/api/restore",
+        json={
+            "trash": str(trash),
+            "reportPath": str(report_path),
+            "groupIds": [1],
+            "dryRun": False,
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_restore_report_level_repairs_already_restored_groups(client, report_path, data, tmp_path):
+    """文件已回到原位、manifest 仍 completed 时，Web 必须能完成状态收尾。"""
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+
+    manifest = next(trash.glob("manifest-*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    for action in payload["actions"]:
+        os.replace(action["dst"], action["src"])  # 模拟上次还原后崩溃
+
+    preview = _preview(client, report_path).json()
+    assert preview["totalFiles"] == 0
+    assert preview["totalAlready"] == 3
+    assert preview["missingGroupIds"] == [], "已在原处的组不能被提示成「没有找到」"
+
+    response = client.post(
+        "/api/restore",
+        json={"trash": str(trash), "reportPath": str(report_path), "dryRun": False},
+    )
+    assert response.status_code == 200, response.text
+    task = _wait(client, response.json()["id"])
+    assert task["state"] == "succeeded", task
+    assert task["alreadyRestored"] == 3
+    assert task["stateSynced"] is True
+
+    view = client.get("/api/report", params={"path": str(report_path)}).json()
+    assert all(group["disposalState"] == "pending" for group in view["groups"])
+
+
+def test_restore_preview_accepts_custom_trash_when_state_is_lost(
+    client, report_path, data, tmp_path
+):
+    """状态文件丢失时，预览需要一个实际隔离区才能从 manifest 回填。"""
+    trash = tmp_path / "custom-trash"
+    _apply_all(client, report_path, trash)
+    Path(str(report_path) + ".state.json").unlink()
+
+    without = _preview(client, report_path).json()
+    assert without["totalFiles"] == 0
+
+    with_trash = client.get(
+        "/api/restore/preview",
+        params=[("reportPath", str(report_path)), ("trash", str(trash))],
+    )
+    assert with_trash.status_code == 200, with_trash.text
+    assert with_trash.json()["totalFiles"] == 3
+
+
+def test_restore_empty_report_path_is_rejected(client, tmp_path):
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    response = client.post(
+        "/api/restore", json={"trash": str(trash), "reportPath": "", "dryRun": False}
+    )
+    assert response.status_code == 422
+
+
+def test_restore_preview_reports_cross_trash_group(client, report_path, data, tmp_path):
+    """同一组在第二个隔离区也有动作时，预览必须标出 crossTrash。"""
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    manifest = next(trash.glob("manifest-*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    second = tmp_path / "default-trash"
+    second.mkdir()
+    actions = []
+    for action in payload["actions"]:
+        if action["groupId"] != 1:
+            continue
+        source = Path(action["dst"])
+        if not source.is_file():
+            continue
+        drive, rest = os.path.splitdrive(action["src"])
+        target = second / drive[0].upper() / rest.lstrip("\\")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        actions.append(
+            {
+                "groupId": 1,
+                "src": action["src"],
+                "dst": str(target),
+                "size": action["size"],
+                "status": "completed",
+            }
+        )
+    (second / "manifest-20260101-000100.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "createdAt": "",
+                "report": str(report_path),
+                "trash": str(second),
+                "actions": actions,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    preview = _preview(client, report_path).json()
+    assert 1 in preview["crossTrashGroupIds"]
+    assert preview["totalFiles"] == 5, "两个隔离区各计一遍组 1，加上组 2"
+
+
+def test_restore_preview_truncated_when_manifest_limit_exceeded(
+    client, report_path, data, tmp_path, monkeypatch
+):
+    import dupfind.web.disposal as disposal_module
+
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    source_manifest = next(trash.glob("manifest-*.json"))
+    for index in range(2):
+        (trash / f"manifest-20260101-00020{index}.json").write_text(
+            source_manifest.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    monkeypatch.setattr(disposal_module, "MAX_PREVIEW_MANIFESTS", 1)
+
+    preview = _preview(client, report_path).json()
+    assert preview["truncated"] is True
+
+
+def test_restore_preview_flags_rejected_action(client, report_path, data, tmp_path):
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    manifest = next(trash.glob("manifest-*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    for action in payload["actions"]:
+        if action["groupId"] == 1:
+            action["dst"] = str(trash / "wrong-batch" / "moved.pdf")
+            break
+    manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    preview = _preview(client, report_path).json()
+    assert preview["totalRejected"] == 1
+    assert preview["totalFiles"] == 2, "被拒绝的动作不能计入「将还原」"
+
+
+def test_restore_report_level_rejects_unverifiable_manifest(
+    client, report_path, data, tmp_path, monkeypatch
+):
+    import dupfind.web.disposal as disposal_module
+
+    trash = tmp_path / "trash"
+    _apply_all(client, report_path, trash)
+    monkeypatch.setattr(disposal_module, "MAX_PREVIEW_MANIFEST_BYTES", 1)
+
+    response = client.post(
+        "/api/restore",
+        json={"trash": str(trash), "reportPath": str(report_path), "dryRun": False},
+    )
+    assert response.status_code == 409
+
+
+def test_restore_legacy_whole_trash_rejects_overwrite(client, tmp_path):
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    response = client.post(
+        "/api/restore",
+        json={"trash": str(trash), "onConflict": "overwrite", "dryRun": False},
+    )
+    assert response.status_code == 400
+
+
+def _short_path(path: Path) -> str:
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, 32768)
+    return buffer.value if length else ""
+
+
+def test_trash_lock_canonicalizes_short_names(tmp_path):
+    """同一隔离区的 8.3 短名写法必须命中同一把锁。"""
+    from dupfind.web.disposal import TrashBusy, TrashLock
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    short = _short_path(trash)
+    if not short or os.path.normcase(short) == os.path.normcase(str(trash)):
+        pytest.skip("该卷未启用 8.3 短名")
+
+    first = TrashLock(str(trash))
+    first.acquire()
+    try:
+        with pytest.raises(TrashBusy):
+            TrashLock(short).acquire()
+    finally:
+        first.release()
 
 
 def test_capture_is_thread_local(tmp_path):

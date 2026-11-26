@@ -295,6 +295,18 @@ class TrashBusy(RuntimeError):
     """同一隔离区已有处置任务在跑。"""
 
 
+def _trash_key(trash: str) -> str:
+    """隔离区的物理路径键：解析 8.3 短名/junction，统一大小写。
+
+    同一个隔离区换个写法（``D:\\LINK`` vs 真实目录）必须落到同一把锁，
+    否则跨进程互斥会被绕过。
+    """
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(trash)))
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(trash))
+
+
 def _lock_path(trash: str) -> str:
     """锁文件放在隔离区的**同级**，不能放进去。
 
@@ -302,8 +314,9 @@ def _lock_path(trash: str) -> str:
     文件都会被 unlink），锁就凭空消失，互斥失效。同级文件在 ``empty`` 的
     遍历范围之外，且随隔离区一起消失（用户删掉隔离区时锁也自然没了）。
     """
-    parent = ntpath.dirname(ntpath.normpath(trash))
-    name = ntpath.basename(ntpath.normpath(trash))
+    physical = _trash_key(trash)
+    parent = ntpath.dirname(physical)
+    name = ntpath.basename(physical)
     return ntpath.join(parent, f".{name}{TRASH_LOCK_SUFFIX}")
 
 

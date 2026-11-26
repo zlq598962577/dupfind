@@ -316,17 +316,27 @@ def restore(
     on_conflict: str = typer.Option(
         "skip", "--on-conflict", help="原位置已有文件时：skip / rename / overwrite"
     ),
+    report: str | None = typer.Option(
+        None,
+        "--report",
+        help="只还原 report 字段指向该报告（绝对路径）的 manifest；不指定时还原整个隔离区",
+    ),
 ) -> None:
     """把隔离区里的文件还原到原位置。"""
     mode = on_conflict.lower()
     if mode not in CONFLICT_MODES:
         _fail(f"--on-conflict 必须是 {', '.join(CONFLICT_MODES)} 之一", EXIT_USAGE)
+    if report is not None:
+        report = os.path.abspath(report)
+        if not os.path.isfile(report):
+            _fail(f"--report 指定的报告不存在: {report}", EXIT_USAGE)
+    options = RestoreOptions(dry_run=dry_run, on_conflict=mode, report=report)
     try:
         if dry_run:
-            code = run_restore(target, RestoreOptions(dry_run=dry_run, on_conflict=mode))
+            code = run_restore(target, options)
         else:
             with TrashLock(_lock_target(target)):
-                code = run_restore(target, RestoreOptions(dry_run=dry_run, on_conflict=mode))
+                code = run_restore(target, options)
     except TrashBusy as exc:
         _fail(str(exc), EXIT_USAGE)
     except RestoreError as exc:

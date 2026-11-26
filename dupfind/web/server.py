@@ -24,9 +24,14 @@ from .disposal import (
     CONFIRM_THRESHOLD_FILES,
     CONFIRM_THRESHOLD_GROUPS,
     DisposalTaskManager,
+    RestoreScopeError,
     TrashBusy,
     build_preview,
+    build_restore_preview,
     default_trash_for,
+    restore_target_groups,
+    scan_restore_scope,
+    validate_restore_scope,
     validate_trash_path,
 )
 from .report_view import build_view
@@ -64,6 +69,11 @@ class ApplyPayload(PreviewPayload):
 
 class RestorePayload(BaseModel):
     trash: str = Field(..., min_length=1)
+    #: 报告级 / 组级还原的作用域。两者都省略时保持旧的整区还原语义
+    #: （CLI 等价行为，现有脚本与测试仍可用）；Web 前端始终带 reportPath。
+    #: min_length=1 防止空串被当成「未提供」而静默退化成整区还原。
+    reportPath: str | None = Field(None, min_length=1)
+    groupIds: list[int] | None = None
     onConflict: str = "skip"
     dryRun: bool = False
 
@@ -304,19 +314,120 @@ def create_app(
             raise HTTPException(status_code=404, detail="还没有处置任务")
         return task.snapshot()
 
+    @app.get("/api/restore/preview")
+    def restore_preview(
+        reportPath: str = Query(..., min_length=1),
+        groupIds: list[int] | None = Query(None),
+        trash: str | None = Query(None),
+    ) -> dict[str, object]:
+        """只读预览：不写文件、不拿隔离区锁。
+
+        ``trash`` 可选：状态文件丢失时，manifest 回填需要一个实际隔离区；
+        不传就只查默认隔离区。前端在常规路径会传当前报告的默认隔离区。
+        """
+        report_path = _validate_report_path(reportPath)
+        try:
+            document = load_report(report_path)
+        except ReportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        state_trash: str | None = None
+        if trash:
+            try:
+                state_trash = validate_trash_path(trash)
+            except RestoreError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        state = load_effective_state(document, trash=state_trash)
+        if not state.identity_ok:
+            raise HTTPException(
+                status_code=409,
+                detail="报告已重新扫描，旧的处置记录不再适用；请重新加载报告后再操作",
+            )
+        try:
+            return build_restore_preview(document, state, groupIds)
+        except RestoreScopeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/restore")
     def restore_start(payload: RestorePayload) -> dict[str, object]:
         mode = payload.onConflict.lower()
         if mode not in CONFLICT_MODES:
             raise HTTPException(status_code=400, detail=f"--on-conflict 必须是 {', '.join(CONFLICT_MODES)} 之一")
+        if payload.groupIds is not None and payload.reportPath is None:
+            raise HTTPException(status_code=400, detail="按组还原必须同时指定 reportPath")
+        if payload.reportPath is None and mode == "overwrite":
+            # 无报告范围的整区覆盖过于危险：旧调用保留 skip/rename，不给 overwrite
+            raise HTTPException(
+                status_code=400,
+                detail="整区还原不允许 overwrite；请指定 reportPath，或改用 CLI",
+            )
         try:
             target = validate_trash_path(payload.trash)
         except RestoreError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not os.path.exists(target):
-            raise HTTPException(status_code=404, detail=f"隔离区不存在: {target}")
+        # 隔离区必须是目录：把任意存在的文件当 target 会让锁文件落在错误位置，
+        # 也无法保证里面是 manifest 而不是用户资料。
+        if not os.path.isdir(target):
+            raise HTTPException(status_code=404, detail=f"隔离区不存在或不是目录: {target}")
+
+        report_path: str | None = None
+        group_ids: frozenset[int] | None = None
+        if payload.reportPath is not None:
+            report_path = str(_validate_report_path(payload.reportPath))
+            try:
+                document = load_report(report_path)
+            except ReportError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            state = load_effective_state(document, trash=target)
+            if not state.identity_ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail="报告已重新扫描，旧的处置记录不再适用；请重新加载报告后再操作",
+                )
+            if payload.groupIds is not None:
+                eligible = {
+                    group_id
+                    for group_id, record in state.groups.items()
+                    if record.state in ("handled", "partial")
+                }
+                for group_id in payload.groupIds:
+                    if group_id not in eligible:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"第 {group_id} 组没有可还原的处置记录",
+                        )
+                try:
+                    validate_restore_scope(document, target, payload.groupIds)
+                except RestoreScopeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                group_ids = frozenset(payload.groupIds)
+            else:
+                # 报告级：预览只统计状态里 handled/partial 的组，执行必须用
+                # 同一集合，并剔除 src 与当前报告不一致（unsafe）的组，否则
+                # 会连被忽略的组、预览明确排除的旧记录一起还原。
+                targets = restore_target_groups(document, state, None)
+                try:
+                    unsafe = scan_restore_scope(document, target, targets)
+                except RestoreScopeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                safe = [group_id for group_id in targets if group_id not in unsafe]
+                if not safe:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="没有可安全还原的处置记录（记录与当前报告不一致或已不存在）",
+                    )
+                group_ids = frozenset(safe)
+
         try:
-            task = disposal.start_restore(target, RestoreOptions(dry_run=payload.dryRun, on_conflict=mode))
+            task = disposal.start_restore(
+                target,
+                RestoreOptions(
+                    dry_run=payload.dryRun,
+                    on_conflict=mode,
+                    report=report_path,
+                    group_ids=group_ids,
+                ),
+                report_path=report_path or "",
+            )
         except TrashBusy as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return task.snapshot()

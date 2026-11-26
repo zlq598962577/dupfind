@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import sys
 from pathlib import Path
@@ -21,16 +22,22 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="dupfind 仅支�
 SIZE = DEFAULT_SIZE
 
 
-def _write_manifest(trash: Path, actions: list[dict]) -> Path:
+def _write_manifest(
+    trash: Path,
+    actions: list[dict],
+    *,
+    report: str = "report.json",
+    name: str = "manifest-20260101-000000.json",
+) -> Path:
     """按 apply 产出的格式写一份 manifest 快照。"""
     trash.mkdir(parents=True, exist_ok=True)
-    path = trash / "manifest-20260101-000000.json"
+    path = trash / name
     path.write_text(
         json.dumps(
             {
                 "version": 1,
                 "createdAt": "2026-01-01T00:00:00+08:00",
-                "report": "report.json",
+                "report": report,
                 "trash": str(trash),
                 "actions": actions,
             },
@@ -41,10 +48,15 @@ def _write_manifest(trash: Path, actions: list[dict]) -> Path:
     return path
 
 
+def _trash_target(source: Path, trash: Path) -> Path:
+    """apply 的镜像布局：<trash>/<盘符>/<src 相对盘符的路径>。"""
+    drive, rest = ntpath.splitdrive(str(source))
+    return trash / drive[0].upper() / rest.lstrip("\\")
+
+
 def _move_to_trash(source: Path, trash: Path) -> Path:
     """模拟 apply 的移动，返回隔离区内的目标路径。"""
-    relative = source.relative_to(source.anchor)
-    target = trash / relative
+    target = _trash_target(source, trash)
     target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(source, target)
     return target
@@ -172,7 +184,7 @@ def test_restore_pending_without_move_is_noop(tmp_path):
     source.parent.mkdir(parents=True)
     source.write_bytes(content_bytes(SIZE, seed=16))
     trash = tmp_path / "trash"
-    target = trash / "C" / "data" / "a.bin"  # 隔离区里并不存在
+    target = _trash_target(source, trash)  # 隔离区里并不存在
 
     manifest = _write_manifest(
         trash,
@@ -495,16 +507,17 @@ def test_forged_trash_field_is_ignored(tmp_path):
     assert victim.exists() and victim.read_bytes() == b"SYSTEM IMPORTANT", "受害者文件被搬走了"
 
 
-def test_restore_refuses_protected_src(tmp_path):
+def test_restore_refuses_protected_src(tmp_path, capsys):
     """伪造的 manifest 想把文件写进系统目录，必须拒绝。
 
-    合法 manifest 里不会有 src 落在受保护路径的动作（apply 从不移动那里的
-    文件），所以这条校验不影响正常还原。
+    dst 做成合法镜像路径，让 ``protected_reason`` 成为唯一拒绝原因 ——
+    否则镜像校验会先拒掉，这条安全分支等于没被测到。
     """
     from dupfind.restore import RestoreOptions, run_restore
 
     trash = tmp_path / "trash"
-    payload = trash / "C" / "a.bin"
+    protected_src = Path("C:/Windows/System32/evil.dll")
+    payload = _trash_target(protected_src, trash)
     payload.parent.mkdir(parents=True)
     payload.write_bytes(b"x")
     manifest = _write_manifest(
@@ -512,7 +525,7 @@ def test_restore_refuses_protected_src(tmp_path):
         [
             {
                 "groupId": 1,
-                "src": "C:\\Windows\\System32\\evil.dll",
+                "src": str(protected_src),
                 "dst": str(payload),
                 "size": 1,
                 "status": "completed",
@@ -523,6 +536,7 @@ def test_restore_refuses_protected_src(tmp_path):
     code = run_restore(manifest, RestoreOptions(dry_run=False))
     assert code == 2, "写入系统目录的伪造动作未被拒绝"
     assert payload.exists(), "被拒绝时隔离区文件应保留"
+    assert "受保护" in capsys.readouterr().out
 
 
 def test_restore_missing_drive_does_not_crash(tmp_path):
@@ -530,7 +544,7 @@ def test_restore_missing_drive_does_not_crash(tmp_path):
     from dupfind.restore import RestoreOptions, run_restore
 
     trash = tmp_path / "trash"
-    payload = trash / "Z" / "x" / "a.bin"
+    payload = trash / "Z" / "nonexistent" / "a.bin"
     payload.parent.mkdir(parents=True)
     payload.write_bytes(b"x" * 10)
     manifest = _write_manifest(
@@ -857,7 +871,7 @@ def test_restore_completed_but_in_place_persists_restored(tmp_path):
             {
                 "groupId": 1,
                 "src": str(source),
-                "dst": str(trash / "C" / "data" / "a.bin"),
+                "dst": str(_trash_target(source, trash)),
                 "size": SIZE,
                 "status": "completed",
             }
@@ -888,3 +902,506 @@ def test_empty_keeps_journal_with_manifests(tmp_path):
     assert code == 0
     assert not manifest_path.exists()
     assert not journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# 按报告 / 按组的还原范围
+# ---------------------------------------------------------------------------
+
+
+def _moved_file(tmp_path: Path, trash: Path, name: str, seed: int) -> tuple[Path, Path]:
+    source = tmp_path / "data" / name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(content_bytes(SIZE, seed=seed))
+    return source, _move_to_trash(source, trash)
+
+
+def test_restore_filters_by_report(tmp_path):
+    """指定报告时只还原该报告的 manifest，另一份报告的记录原样保留。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report_a = tmp_path / "report-a.json"
+    report_b = tmp_path / "report-b.json"
+    report_a.write_text("{}", encoding="utf-8")
+    report_b.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    first = _moved_file(tmp_path, trash, "a.bin", seed=40)
+    second = _moved_file(tmp_path, trash, "b.bin", seed=41)
+    for index, (report, (source, target)) in enumerate(((report_a, first), (report_b, second))):
+        _write_manifest(
+            trash,
+            [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+            report=str(report),
+            name=f"manifest-20260101-00000{index}.json",
+        )
+
+    stats = RestoreStats()
+    code = run_restore(trash, RestoreOptions(dry_run=False, report=str(report_a)), stats=stats)
+    assert code == 0
+    assert first[0].is_file() and not first[1].exists()
+    assert not second[0].exists() and second[1].is_file(), "另一份报告的文件被误还原"
+    assert stats.filtered_manifests == 1
+
+
+def test_restore_report_filter_skips_relative_report(tmp_path):
+    """旧版 manifest 的相对 report 无法可靠解析，按报告还原时必须跳过。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=42)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report="report.json",
+    )
+
+    stats = RestoreStats()
+    code = run_restore(manifest, RestoreOptions(dry_run=False, report=str(tmp_path / "report.json")), stats=stats)
+    assert code == 1
+    assert not source.exists() and target.is_file()
+    assert stats.filtered_manifests == 1
+
+
+def test_restore_group_filter_only_touches_selected_group(tmp_path):
+    """按组还原只动选中的组，未选中的动作在写回后仍是 completed。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    actions = []
+    moved = []
+    for index, group_id in enumerate((1, 2), start=50):
+        source, target = _moved_file(tmp_path, trash, f"g{group_id}.bin", seed=index)
+        actions.append(
+            {"groupId": group_id, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}
+        )
+        moved.append((source, target))
+    manifest = _write_manifest(trash, actions, report=str(report))
+
+    stats = RestoreStats()
+    code = run_restore(
+        manifest,
+        RestoreOptions(dry_run=False, report=str(report), group_ids=frozenset({1})),
+        stats=stats,
+    )
+    assert code == 0
+    assert moved[0][0].is_file() and not moved[0][1].exists()
+    assert not moved[1][0].exists() and moved[1][1].is_file()
+    assert stats.filtered_actions == 1
+    saved = json.loads(manifest.read_text(encoding="utf-8"))
+    status_by_group = {item["groupId"]: item["status"] for item in saved["actions"]}
+    assert status_by_group == {1: "restored", 2: "completed"}
+
+
+def test_restore_group_filter_aggregates_across_manifests(tmp_path):
+    """同一个组跨多份 manifest（partial 重试）时，按组还原要全部还原。"""
+    from dupfind.restore import RestoreOptions, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    moved = []
+    for index in range(2):
+        source, target = _moved_file(tmp_path, trash, f"retry{index}.bin", seed=60 + index)
+        moved.append((source, target))
+        _write_manifest(
+            trash,
+            [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+            report=str(report),
+            name=f"manifest-20260101-00001{index}.json",
+        )
+
+    code = run_restore(
+        trash, RestoreOptions(dry_run=False, report=str(report), group_ids=frozenset({1}))
+    )
+    assert code == 0
+    assert all(source.is_file() for source, _ in moved)
+    assert not any(target.exists() for _, target in moved)
+
+
+def test_restore_group_filter_cannot_cross_report(tmp_path):
+    """组号只在报告内唯一：另一份报告的同号组不能被组过滤命中。"""
+    from dupfind.restore import RestoreOptions, run_restore
+
+    report_a = tmp_path / "report-a.json"
+    report_b = tmp_path / "report-b.json"
+    report_a.write_text("{}", encoding="utf-8")
+    report_b.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    first = _moved_file(tmp_path, trash, "a.bin", seed=70)
+    second = _moved_file(tmp_path, trash, "b.bin", seed=71)
+    for index, (report, (source, target)) in enumerate(((report_a, first), (report_b, second))):
+        _write_manifest(
+            trash,
+            [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+            report=str(report),
+            name=f"manifest-20260101-00002{index}.json",
+        )
+
+    code = run_restore(
+        trash,
+        RestoreOptions(dry_run=False, report=str(report_a), group_ids=frozenset({1})),
+    )
+    assert code == 0
+    assert first[0].is_file() and not first[1].exists()
+    assert not second[0].exists() and second[1].is_file()
+
+
+def test_restore_scope_filter_zero_hit_returns_one(tmp_path):
+    """过滤后没有任何命中仍是「没事可做」的退出码 1。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=72)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 2, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report=str(report),
+    )
+
+    stats = RestoreStats()
+    code = run_restore(
+        manifest,
+        RestoreOptions(dry_run=False, report=str(report), group_ids=frozenset({1})),
+        stats=stats,
+    )
+    assert code == 1
+    assert stats.filtered_actions == 1
+    assert not source.exists() and target.is_file()
+
+
+def test_restore_rejects_non_mirror_dst(tmp_path):
+    """dst 必须与 src 构成镜像路径，否则伪造 manifest 能搬走隔离区里的其他文件。"""
+    from dupfind.restore import RestoreOptions, run_restore
+
+    trash = tmp_path / "trash"
+    source, _ = _moved_file(tmp_path, trash, "a.bin", seed=73)
+    source.write_bytes(b"ORIGINAL")  # 原位置重新出现，模拟被别的文件占用
+    letter = ntpath.splitdrive(str(source))[0][0].upper()
+    wrong = trash / letter / "other" / "a.bin"
+    wrong.parent.mkdir(parents=True, exist_ok=True)
+    wrong.write_bytes(b"OTHER BATCH")
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(wrong), "size": SIZE, "status": "completed"}],
+    )
+
+    code = run_restore(manifest, RestoreOptions(dry_run=False))
+    assert code == 2, "非镜像 dst 未被拒绝"
+    assert source.read_bytes() == b"ORIGINAL"
+    assert wrong.read_bytes() == b"OTHER BATCH"
+
+
+def test_restore_counts_already_restored_separately(tmp_path):
+    """幂等命中单独计数，预览才能把「真正会移动」和「已在原处」分开。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=74)
+    os.replace(target, source)  # 模拟上次还原成功但没来得及写回
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+    )
+
+    stats = RestoreStats()
+    code = run_restore(manifest, RestoreOptions(dry_run=False), stats=stats)
+    assert code == 0
+    assert stats.restored == 1
+    assert stats.already_restored == 1
+
+
+def test_restore_reports_state_sync_failure(tmp_path):
+    """报告不可读导致状态同步失败时，还原本身成功但要标记 state_synced=False。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    missing_report = tmp_path / "missing-report.json"
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=75)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report=str(missing_report),
+    )
+
+    stats = RestoreStats()
+    code = run_restore(
+        manifest, RestoreOptions(dry_run=False, report=str(missing_report)), stats=stats
+    )
+    assert code == 0
+    assert source.is_file()
+    assert stats.state_synced is False
+
+
+def test_restore_report_filter_skips_unreadable_manifest(tmp_path):
+    """按报告还原时，一份损坏的其他批次不能让整批失败。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=76)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report=str(report),
+        name="manifest-20260101-000030.json",
+    )
+    (trash / "manifest-20260101-000031.json").write_text("{not json", encoding="utf-8")
+
+    stats = RestoreStats()
+    code = run_restore(trash, RestoreOptions(dry_run=False, report=str(report)), stats=stats)
+    assert code == 0
+    assert source.is_file()
+    assert stats.unreadable_manifests == 1
+    assert manifest.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 审查回归：镜像路径、相对 report、状态同步失败
+# ---------------------------------------------------------------------------
+
+
+def test_restore_mirror_accepts_extensionless_conflict_suffix(tmp_path):
+    """无扩展名文件的 .dupfind-N 冲突名必须能还原，不能被当成扩展名变化。"""
+    from dupfind.restore import RestoreOptions, run_restore
+
+    trash = tmp_path / "trash"
+    source = tmp_path / "data" / "LICENSE"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(content_bytes(SIZE, seed=80))
+    base = _trash_target(source, trash)
+    target = base.with_name(base.name + ".dupfind-1")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, target)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+    )
+
+    code = run_restore(manifest, RestoreOptions(dry_run=False))
+    assert code == 0, "无扩展名文件的 .dupfind-N 冲突名被误判为伪造"
+    assert source.is_file() and not target.exists()
+
+
+def test_restore_mirror_normalizes_dot_segments(tmp_path):
+    """src/dst 里的 "." 段在 apply 时会原样保留，还原时必须先规约再比较。"""
+    from dupfind.restore import RestoreOptions, run_restore
+
+    trash = tmp_path / "trash"
+    source = tmp_path / "data" / "a.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(content_bytes(SIZE, seed=81))
+    drive, _ = ntpath.splitdrive(str(source))
+    relative = ntpath.relpath(str(source), drive + "\\")
+    dot_relative = ntpath.join(ntpath.dirname(relative), ".", ntpath.basename(relative))
+    src_text = ntpath.join(drive + "\\", dot_relative)
+    dst_text = ntpath.join(str(trash), ntpath.splitdrive(str(source))[0][0].upper(), dot_relative)
+    target = Path(dst_text)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(source, target)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": src_text, "dst": dst_text, "size": SIZE, "status": "completed"}],
+    )
+
+    code = run_restore(manifest, RestoreOptions(dry_run=False))
+    assert code == 0, "含 . 段的合法路径被镜像校验拒绝"
+    assert source.is_file() and not target.exists()
+
+
+def test_restore_report_filter_rejects_relative_report_even_if_cwd_matches(tmp_path, monkeypatch):
+    """相对 report 不能按当前 CWD 猜成绝对路径，即使猜中的文件确实存在。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=82)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report="report.json",
+    )
+    report_path = tmp_path / "report.json"
+    report_path.write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    stats = RestoreStats()
+    code = run_restore(
+        manifest, RestoreOptions(dry_run=False, report=str(report_path)), stats=stats
+    )
+    assert code == 1
+    assert stats.filtered_manifests == 1
+    assert not source.exists() and target.is_file()
+
+
+def test_restore_relative_report_marks_state_unsynced(tmp_path):
+    """有 report 字段但不是绝对路径时无法可靠同步状态，必须标记未同步。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=83)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report="report.json",
+    )
+
+    stats = RestoreStats()
+    code = run_restore(manifest, RestoreOptions(dry_run=False), stats=stats)
+    assert code == 0
+    assert source.is_file()
+    assert stats.state_synced is False
+
+
+def test_restore_persist_failure_marks_state_unsynced(tmp_path, monkeypatch):
+    from dupfind import restore as restore_module
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=84)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report=str(report),
+    )
+    monkeypatch.setattr(restore_module, "_persist", lambda document: False)
+
+    stats = RestoreStats()
+    code = run_restore(manifest, RestoreOptions(dry_run=False, report=str(report)), stats=stats)
+    assert code == 0
+    assert stats.persist_failures == 1
+    assert stats.state_synced is False
+
+
+def test_restore_single_corrupt_manifest_with_report_raises(tmp_path):
+    """显式指定的单个 manifest 读不出来时不能静默当成「没事可做」。"""
+    from dupfind.restore import RestoreError, RestoreOptions, run_restore
+
+    trash = tmp_path / "trash"
+    trash.mkdir()
+    corrupt = trash / "manifest-20260101-000000.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(RestoreError):
+        run_restore(corrupt, RestoreOptions(dry_run=False, report=str(report)))
+
+
+def test_restore_samefile_completed_is_finalized(tmp_path):
+    """src/dst 是同一物理文件（硬链接）时，completed 也要写回并同步状态。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    trash = tmp_path / "trash"
+    source = tmp_path / "data" / "a.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(content_bytes(SIZE, seed=90))
+    target = _trash_target(source, trash)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.link(source, target)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+    )
+
+    stats = RestoreStats()
+    code = run_restore(manifest, RestoreOptions(dry_run=False), stats=stats)
+    assert code == 0
+    assert stats.already_restored == 1
+    saved = json.loads(manifest.read_text(encoding="utf-8"))
+    assert saved["actions"][0]["status"] == "restored"
+
+
+def test_restore_skips_journal_with_invalid_utf8(tmp_path):
+    """崩溃留下的半截多字节 UTF-8 不能让预览/还原抛 UnicodeDecodeError。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=91)
+    _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report=str(report),
+        name="manifest-20260101-000040.json",
+    )
+    bad = trash / "manifest-20260101-000041.json.journal"
+    bad.write_bytes(b'{"groupId": 1, "src": "\xe4\xb8')
+
+    stats = RestoreStats()
+    code = run_restore(trash, RestoreOptions(dry_run=False, report=str(report)), stats=stats)
+    assert code == 0
+    assert source.is_file()
+    assert stats.filtered_manifests == 1  # 坏 journal 没有 report，按报告过滤跳过
+
+
+def test_restore_unreadable_manifest_skips_state_sync(tmp_path):
+    """有 manifest 读不出来时，sync 也会漏看它，必须跳过同步而不是误删状态。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=92)
+    _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report=str(report),
+        name="manifest-20260101-000050.json",
+    )
+    (trash / "manifest-20260101-000051.json").write_text("{not json", encoding="utf-8")
+
+    stats = RestoreStats()
+    code = run_restore(trash, RestoreOptions(dry_run=False, report=str(report)), stats=stats)
+    assert code == 0
+    assert source.is_file()
+    assert stats.unreadable_manifests == 1
+    assert stats.state_synced is False, "有坏 manifest 时不能声称状态已同步"
+
+
+def test_restore_whole_trash_aborts_on_corrupt_manifest(tmp_path):
+    """整区还原保持原语义：任何一份 manifest 读不出来都在移动前中止。"""
+    from dupfind.restore import RestoreError, RestoreOptions, run_restore
+
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=93)
+    _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        name="manifest-20260101-000060.json",
+    )
+    (trash / "manifest-20260101-000061.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(RestoreError):
+        run_restore(trash, RestoreOptions(dry_run=False))
+    assert not source.exists() and target.is_file(), "中止前不应移动任何文件"
+
+
+def test_restore_manifest_without_report_requires_whole_trash(tmp_path):
+    """没有 report 字段的快照整区可还原，按报告过滤时必须跳过。"""
+    from dupfind.restore import RestoreOptions, RestoreStats, run_restore
+
+    report = tmp_path / "report.json"
+    report.write_text("{}", encoding="utf-8")
+    trash = tmp_path / "trash"
+    source, target = _moved_file(tmp_path, trash, "a.bin", seed=94)
+    manifest = _write_manifest(
+        trash,
+        [{"groupId": 1, "src": str(source), "dst": str(target), "size": SIZE, "status": "completed"}],
+        report="",
+    )
+
+    stats = RestoreStats()
+    code = run_restore(manifest, RestoreOptions(dry_run=False, report=str(report)), stats=stats)
+    assert code == 1
+    assert stats.filtered_manifests == 1
+    assert target.is_file()
+
+    assert run_restore(manifest, RestoreOptions(dry_run=False)) == 0
+    assert source.is_file()

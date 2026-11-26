@@ -267,7 +267,12 @@ def _default_trash(root: str) -> str | None:
     return ntpath.join(drive + "\\", "_dupfind_trash")
 
 
-def scan_manifest_states(report_path: str | Path, trash: str | None, *, limit: int = MANIFEST_SCAN_LIMIT) -> tuple[dict[int, GroupState], int]:
+def scan_manifest_states(
+    report_path: str | Path,
+    trash: str | None,
+    *,
+    limit: int | None = MANIFEST_SCAN_LIMIT,
+) -> tuple[dict[int, GroupState], int]:
     """从隔离区 manifest 反推某份报告的已处置组。
 
     只认 ``status == "completed"`` 的动作：``pending`` 可能只是「登记了、
@@ -285,7 +290,8 @@ def scan_manifest_states(report_path: str | Path, trash: str | None, *, limit: i
     target = os.path.normcase(ntpath.normpath(str(report_path)))
     result: dict[int, GroupState] = {}
     matched = 0
-    for path in manifests[:limit]:
+    selected = manifests if limit is None else manifests[:limit]
+    for path in selected:
         try:
             document = load_manifest(path)
         except (RestoreError, ValueError, TypeError, OSError):
@@ -404,27 +410,35 @@ def _is_within(path: str, root_key: str) -> bool:
         return False
 
 
-def sync_after_restore(report_path: str | Path, trash: str | None) -> None:
+def sync_after_restore(report_path: str | Path, trash: str | None) -> bool:
     """还原之后重算状态：被还原的组必须回到「待处理」。
 
     只按**本隔离区** manifest 的 completed 动作重算：清除 manifest 落在本
     隔离区、且已经没有完成动作的记录；其他隔离区的 handled 记录与用户显式
     标记的 ``ignored`` / ``pending`` 原样保留。报告文件不存在或身份不匹配时
-    静默跳过 —— 还原本身已经完成，状态只是展示层的信息。
+    返回 False —— 还原本身已经完成，但调用方要据此提示状态可能仍是旧的。
     """
     if not report_path or not trash:
-        return
+        return False
+    # 相对 report 是旧版 manifest 的产物，按当前进程 CWD 解析可能指向另一份
+    # 同名报告，把无关报告的状态文件改写掉；没有可靠基准就拒绝同步。
+    text = str(report_path)
+    drive, _ = ntpath.splitdrive(text)
+    if not ntpath.isabs(text) or not drive:
+        return False
     try:
-        document = load_report(report_path)
+        document = load_report(text)
     except (ReportError, OSError, ValueError):
-        return
+        return False
     try:
         store = ReportStateStore(document.path)
         with _lock_for(store.path):
             if not store.load(report_identity(document)):
-                return
+                return False
             groups = store.groups
-            manifest_groups, _ = scan_manifest_states(document.path, trash)
+            # 写操作必须扫描全部 manifest：默认 200 份只是视图加载的上限，
+            # 拿截断结果去反向删除记录会把更早批次仍留在隔离区的组误清。
+            manifest_groups, _ = scan_manifest_states(document.path, trash, limit=None)
             trash_key = _directory_key(trash)
             for group_id, record in list(groups.items()):
                 if record.state in ("ignored", "pending"):
@@ -439,7 +453,8 @@ def sync_after_restore(report_path: str | Path, trash: str | None) -> None:
                 groups.setdefault(group_id, record)
             store.replace_groups(groups)
     except OSError:
-        return
+        return False
+    return True
 
 
 __all__ = [

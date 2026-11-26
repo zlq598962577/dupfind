@@ -33,6 +33,10 @@
   // 报告加载请求序号：忽略/处置后的多次 reloadReport 可能乱序返回，
   // 旧响应绝不能覆盖新视图
   let loadSeq = 0;
+  // 还原预览请求序号：连续点不同组的「还原此组」时，旧预览不能覆盖新确认框
+  let restoreSeq = 0;
+  // 从处置进度框打开还原确认框时，取消后要把进度框（含「清空隔离区」）还回去
+  let restoreReturnProgress = false;
 
   const STATUS_TEXT = { confirmed: "确认", suspect: "疑似", shared: "硬链接" };
   const PHASE_TEXT = { scanning: "遍历中", grouping: "分组中", verifying: "内容校验中", done: "完成" };
@@ -440,12 +444,9 @@
     const handled = disposal.handled || 0;
     const partial = disposal.partial || 0;
     const ignored = disposal.ignored || 0;
-    if (handled + partial + ignored > 0) {
-      $("stateBannerText").textContent = `已处置 ${handled} 组 · 部分处置 ${partial} 组 · 已忽略 ${ignored} 组`;
-      $("stateBanner").hidden = false;
-    } else {
-      $("stateBanner").hidden = true;
-    }
+    // 文本无论如何都更新：隐藏时留着旧值，下次显示会先闪一帧陈旧数字
+    $("stateBannerText").textContent = `已处置 ${handled} 组 · 部分处置 ${partial} 组 · 已忽略 ${ignored} 组`;
+    $("stateBanner").hidden = handled + partial + ignored === 0;
   }
 
   function groupMatchesCategory(group) {
@@ -813,8 +814,14 @@
     const actions = el("div", "group-actions");
     if (disposalState === "ignored") {
       actions.append(actionButton("恢复为待处理", () => setGroupState(group.id, "pending")));
-    } else if (disposalState !== "handled") {
-      actions.append(actionButton("忽略此组", () => setGroupState(group.id, "ignored")));
+    } else {
+      // 已处置 / 部分处置的组可以精确还原这一组，不必动整个隔离区
+      if (disposalState === "handled" || disposalState === "partial") {
+        actions.append(actionButton("还原此组", () => confirmRestore([group.id])));
+      }
+      if (disposalState !== "handled") {
+        actions.append(actionButton("忽略此组", () => setGroupState(group.id, "ignored")));
+      }
     }
     if (actions.children.length > 0) body.append(actions);
 
@@ -879,6 +886,12 @@
       toast("请填写报告 JSON 路径", true);
       return;
     }
+    // 切换报告后，旧报告的还原预览/确认框必须失效，否则按钮会对着新报告执行
+    restoreSeq += 1;
+    if (!opts.silent && !$("modal").hidden) {
+      restoreReturnProgress = false;
+      closeModal();
+    }
     $("loadReportBtn").disabled = true;
     const seq = ++loadSeq;
     try {
@@ -937,6 +950,10 @@
 
   function closeModal() {
     $("modal").hidden = true;
+    if (restoreReturnProgress) {
+      restoreReturnProgress = false;
+      $("progressModal").hidden = false;
+    }
   }
 
   function previewNode(label, value) {
@@ -1180,7 +1197,33 @@
 
     const stats = $("disposalStats");
     stats.replaceChildren();
-    if (!isApply) return;
+    if (!isApply) {
+      if (task.kind === "restore") {
+        if (task.state === "running") {
+          stats.append(el("span", "hint", "正在按 manifest 还原文件…"));
+          return;
+        }
+        const moved = Math.max(0, (task.restoredFiles || 0) - (task.alreadyRestored || 0));
+        [
+          ["已还原", `${moved} 个`],
+          ["已在原处", String(task.alreadyRestored || 0)],
+          ["总大小", task.restoredText || "0 B"],
+          ["缺失", String(task.missingFiles || 0)],
+          ["失败", String(task.failedFiles || 0)],
+        ].forEach(([label, value]) => {
+          const node = el("span");
+          node.append(document.createTextNode(`${label} `));
+          node.append(el("b", null, value));
+          stats.append(node);
+        });
+        if (task.stateSynced === false) {
+          stats.append(
+            el("p", "hint warn-text", "处置状态未能同步：页面可能仍把这些组显示为已处置。")
+          );
+        }
+      }
+      return;
+    }
     [
       ["已移动", `${task.movedFiles} 个`],
       ["释放", task.movedText || "0 B"],
@@ -1276,9 +1319,12 @@
     // 条件写成 state !== failed 会让「移动 2 个、失败 1 个」的任务失去还原入口，
     // 已移动的文件只能靠 CLI 捞回来。
     if (movedAnything) {
-      const restore = el("button", "secondary-btn", "还原");
+      // 只还原本任务实际处置过的组；包含该组更早批次的文件（组级语义），
+      // 确认框会把实际文件数列出来。
+      const restoreIds = (task.handledGroupIds || []).concat(task.partialGroupIds || []);
+      const restore = el("button", "secondary-btn", "还原本次处置");
       restore.type = "button";
-      restore.addEventListener("click", () => runRestore(task.trash));
+      restore.addEventListener("click", () => confirmRestore(restoreIds.length ? restoreIds : null));
       foot.append(restore);
 
       const purge = el("button", "primary-btn danger", "清空隔离区");
@@ -1302,12 +1348,18 @@
     }
 
     if (task.kind === "restore") {
+      // 还原会撤销对应组的「已处置」标记（sync_after_restore），失败也可能是
+      // 部分成功，两种情况都要刷新视图
+      if (state.view) await reloadReport({ keepFilters: true });
       // 失败原因已经写在弹窗里；不能再提示「已还原」，否则用户会以为文件
       // 回到了原位，实际还在隔离区
       if (task.state === "failed") return;
-      toast(task.message || "已从隔离区还原");
-      // 还原会撤销对应组的「已处置」标记（sync_after_restore），视图要跟着更新
-      if (state.view) await reloadReport({ keepFilters: true });
+      const moved = Math.max(0, (task.restoredFiles || 0) - (task.alreadyRestored || 0));
+      const parts = [`已还原 ${moved} 个文件`];
+      if (task.alreadyRestored) parts.push(`其中 ${task.alreadyRestored} 个已在原处`);
+      parts.push(task.restoredText || "0 B");
+      if (task.missingFiles) parts.push(`${task.missingFiles} 个缺失`);
+      toast(parts.join(" · "));
       return;
     }
 
@@ -1318,11 +1370,197 @@
     updateActionBar();
   }
 
-  async function runRestore(trash) {
+  /** 还原预览 + 确认框。groupIds 为 null 时作用于本报告全部已处置组。 */
+  async function confirmRestore(groupIds) {
+    if (!state.view) return;
+    const seq = ++restoreSeq;
+    const reportPath = state.view.reportPath;
+    const params = new URLSearchParams({ reportPath });
+    const trash = trashForView();
+    if (trash) params.set("trash", trash);
+    (groupIds || []).forEach((id) => params.append("groupIds", String(id)));
+    let preview;
+    try {
+      preview = await api(`/api/restore/preview?${params.toString()}`);
+    } catch (error) {
+      if (seq !== restoreSeq) return;
+      toast(`无法预览还原：${error.message}`, true);
+      return;
+    }
+    if (seq !== restoreSeq) return;
+
+    const unsafe = new Set(preview.unsafeGroupIds || []);
+    const requested = groupIds || null;
+    const previewGroups = Array.isArray(preview.groupIds) ? preview.groupIds : [];
+    // 无论组级还是报告级，执行都只发「预览里真正统计过、且不是 unsafe」的
+    // 组：报告级若留空 groupIds，服务端会用另一个隔离区重新推导状态，可能
+    // 还原预览从未展示过的批次。
+    const baseIds = requested || previewGroups;
+    const effectiveIds = baseIds.filter((id) => !unsafe.has(id));
+    const allRequestedUnsafe = baseIds.length > 0 && effectiveIds.length === 0;
+    const totalAlready = preview.totalAlready || 0;
+    const totalRejected = preview.totalRejected || 0;
+    const usable = (preview.trashes || []).filter(
+      (item) => item.exists && (item.files > 0 || item.alreadyRestored > 0)
+    );
+    const detailBuckets = (preview.trashes || []).filter(
+      (item) =>
+        item.exists &&
+        (item.files > 0 ||
+          item.alreadyRestored > 0 ||
+          item.missing > 0 ||
+          item.conflicts > 0 ||
+          item.rejected > 0 ||
+          item.skippedPending > 0 ||
+          item.unreadable > 0)
+    );
+
+    const nodes = [];
+    const scopeText = requested && requested.length ? `选中的 ${requested.length} 组` : "本报告全部已处置组";
+    nodes.push(previewNode("范围", scopeText));
+    nodes.push(
+      previewNode(
+        "将还原",
+        preview.totalFiles > 0 ? `${preview.totalFiles} 个文件 · ${preview.totalText}` : "0 个文件"
+      )
+    );
+    if (totalAlready > 0) {
+      nodes.push(previewNode("已在原处", `${totalAlready} 个（会写回记录并把组恢复为待处理）`));
+    }
+
+    detailBuckets.forEach((item) => {
+      nodes.push(previewNode("隔离区", item.path));
+      const details = [];
+      if (item.alreadyRestored) details.push(`${item.alreadyRestored} 个已在原处`);
+      if (item.missing) details.push(`${item.missing} 个缺失`);
+      if (item.conflicts) details.push(`${item.conflicts} 个原位置已有文件（默认跳过）`);
+      if (item.skippedPending) details.push(`${item.skippedPending} 个未实际移动`);
+      if (item.rejected) details.push(`${item.rejected} 个记录不合法（会被拒绝）`);
+      if (item.unreadable) details.push(`${item.unreadable} 份记录无法读取`);
+      if (details.length) nodes.push(el("p", "hint", `另有：${details.join(" · ")}。`));
+    });
+
+    if (preview.unscopedManifests) {
+      nodes.push(
+        el(
+          "p",
+          "hint warn-text",
+          `隔离区里还有 ${preview.unscopedManifests} 份记录无法归属到本报告（旧版本、相对路径或仅 journal），Web 不会动它们；可用 dupfind restore <隔离区> --report <本报告> 或整区还原。`
+        )
+      );
+    }
+    if (preview.totalOtherReportManifests) {
+      nodes.push(
+        el(
+          "p",
+          "hint",
+          `隔离区里有 ${preview.totalOtherReportManifests} 份其他报告的批次，不受本次还原影响。`
+        )
+      );
+    }
+    if (totalRejected) {
+      nodes.push(
+        el("p", "hint warn-text", `有 ${totalRejected} 个动作记录不合法（路径越界/镜像不符），已被排除。`)
+      );
+    }
+    if (preview.staleGroupIds && preview.staleGroupIds.length) {
+      nodes.push(
+        el(
+          "p",
+          "hint warn-text",
+          `状态里有 ${preview.staleGroupIds.length} 个组号不在当前报告中（报告可能已重新扫描），已忽略。`
+        )
+      );
+    }
+    if (unsafe.size > 0) {
+      let detail;
+      if (!requested) {
+        detail = `第 ${[...unsafe].join("、")} 组已从本次还原中排除。`;
+      } else if (allRequestedUnsafe) {
+        detail = "选中的组全部被排除，没有可还原的组。";
+      } else {
+        detail = `已从本次还原中排除 ${[...unsafe].join("、")} 组。`;
+      }
+      nodes.push(
+        el("p", "hint error-text", `隔离区记录与当前报告不一致（报告可能已重新扫描）：${detail}`)
+      );
+    }
+    if (preview.crossTrashGroupIds && preview.crossTrashGroupIds.length) {
+      nodes.push(
+        el(
+          "p",
+          "hint error-text",
+          `第 ${preview.crossTrashGroupIds.join("、")} 组分布在多个隔离区；Web 暂不支持跨隔离区合并还原，请用 CLI 分别还原。`
+        )
+      );
+    }
+    if (preview.truncated) {
+      nodes.push(
+        el(
+          "p",
+          "hint error-text",
+          "隔离区记录数量或体积超出 Web 预览上限，无法安全统计；请用 CLI 整区还原。"
+        )
+      );
+    }
+    if (preview.totalUnreadable) {
+      nodes.push(
+        el("p", "hint warn-text", `另有 ${preview.totalUnreadable} 份隔离区记录无法读取，未计入统计。`)
+      );
+    }
+    if (preview.missingGroupIds && preview.missingGroupIds.length) {
+      nodes.push(el("p", "hint", `第 ${preview.missingGroupIds.join("、")} 组在隔离区里没有找到相关记录。`));
+    }
+
+    const foot = [];
+    const cancel = el("button", "ghost-btn", "取消");
+    cancel.type = "button";
+    cancel.addEventListener("click", closeModal);
+    foot.push(cancel);
+
+    if (usable.length === 0) {
+      nodes.push(el("p", "hint", "没有可还原的文件。"));
+    } else if (usable.length > 1) {
+      nodes.push(
+        el("p", "hint error-text", "检测到多个隔离区都有可还原文件，Web 一次只能还原一个；请用 CLI 分别还原。")
+      );
+    }
+    const blocked =
+      usable.length !== 1 ||
+      (preview.crossTrashGroupIds || []).length > 0 ||
+      allRequestedUnsafe ||
+      Boolean(preview.truncated);
+    const btn = el("button", "primary-btn", "还原");
+    btn.type = "button";
+    btn.disabled =
+      blocked ||
+      effectiveIds.length === 0 ||
+      (preview.totalFiles === 0 && totalAlready === 0);
+    btn.addEventListener("click", () => startRestore(usable[0].path, effectiveIds, reportPath));
+    foot.push(btn);
+    // 隐藏进度框放到确认框真正打开时：预览失败或取消不能把进度框弄丢
+    restoreReturnProgress = !$("progressModal").hidden;
     $("progressModal").hidden = true;
+    openModal("确认还原", nodes, foot);
+  }
+
+  async function startRestore(trash, groupIds, reportPath) {
+    if (!state.view || state.view.reportPath !== reportPath) {
+      closeModal();
+      toast("报告已切换，请重新打开还原预览", true);
+      return;
+    }
+    if (!groupIds || groupIds.length === 0) {
+      closeModal();
+      toast("没有可还原的组", true);
+      return;
+    }
+    closeModal();
     showProgressModal("restore");
     try {
-      const task = await api("/api/restore", { method: "POST", body: { trash, dryRun: false } });
+      // 报告级也显式带 groupIds：执行范围必须与刚才的预览完全一致
+      const body = { trash, reportPath, groupIds, dryRun: false };
+      const task = await api("/api/restore", { method: "POST", body });
       state.disposalTaskId = task.id;
       renderDisposalProgress(task);
       pollDisposal(task.id);
@@ -1458,6 +1696,7 @@
     $("typeShowAllBtn").addEventListener("click", () => setCategory("all"));
     $("stateShowHandledBtn").addEventListener("click", () => setDisposal("handled"));
     $("stateShowIgnoredBtn").addEventListener("click", () => setDisposal("ignored"));
+    $("stateRestoreBtn").addEventListener("click", () => confirmRestore(null));
 
     let searchTimer = null;
     $("searchInput").addEventListener("input", (event) => {

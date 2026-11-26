@@ -24,8 +24,20 @@ from typing import Any
 from ..apply import ApplyOptions, ApplyStats, DisposalPlan, ExecutionError, build_plan, execute_plan
 from ..console import capture
 from ..report import ReportDocument
-from ..report_state import record_apply_result
-from ..restore import EmptyOptions, RestoreError, RestoreOptions, run_empty, run_restore
+from ..report_state import EffectiveState, record_apply_result
+from ..restore import (
+    JOURNAL_SUFFIX,
+    EmptyOptions,
+    RestoreError,
+    RestoreOptions,
+    RestoreStats,
+    discover_manifests,
+    load_manifest,
+    run_empty,
+    run_restore,
+    validate_action,
+)
+from ..safety import CanonicalCache, canonical
 from ..trash import TrashBusy, TrashError, TrashLock
 from ..units import format_size
 from ..win32 import long_path
@@ -37,6 +49,15 @@ CONFIRM_THRESHOLD_BYTES = 1 << 30
 #: 一次处置超过这么多组，同样要求输入 DELETE：单看文件数会漏掉「全是小组」
 #: 但涉及上千个目录、几乎无法人工复核的批量操作。
 CONFIRM_THRESHOLD_GROUPS = 100
+#: 还原预览的读取边界：拒绝静默截断，超出部分会在结果里标记 truncated。
+MAX_PREVIEW_MANIFESTS = 500
+MAX_PREVIEW_MANIFEST_BYTES = 64 * 1024 * 1024
+#: 单个预览最多逐动作校验多少个动作；超出时结果标记 truncated，前端禁用还原。
+MAX_PREVIEW_ACTIONS = 5000
+
+
+class RestoreScopeError(RuntimeError):
+    """组级还原范围不合法：组不存在、没有处置记录，或 manifest 与报告不符。"""
 
 
 @dataclass(slots=True)
@@ -216,6 +237,13 @@ class DisposalTask:
     processed_groups: int = 0
     moved_files: int = 0
     moved_bytes: int = 0
+    #: 还原任务的统计。moved_* 只用于 apply，restore 单独一组字段，避免前端
+    #: 把「还原了 3 个」误读成「移动了 3 个到隔离区」。
+    restored_files: int = 0
+    restored_bytes: int = 0
+    already_restored: int = 0
+    missing_files: int = 0
+    state_synced: bool = True
     skipped_files: int = 0
     failed_files: int = 0
     message: str | None = None
@@ -243,6 +271,12 @@ class DisposalTask:
             "movedFiles": self.moved_files,
             "movedBytes": self.moved_bytes,
             "movedText": format_size(self.moved_bytes),
+            "restoredFiles": self.restored_files,
+            "restoredBytes": self.restored_bytes,
+            "restoredText": format_size(self.restored_bytes),
+            "alreadyRestored": self.already_restored,
+            "missingFiles": self.missing_files,
+            "stateSynced": self.state_synced,
             "skippedFiles": self.skipped_files,
             "failedFiles": self.failed_files,
             "message": self.message,
@@ -283,12 +317,12 @@ class DisposalTaskManager:
 
     def running_for(self, trash: str) -> DisposalTask | None:
         """同一隔离区上仍在跑的任务（本进程内）。"""
-        target = os.path.normcase(os.path.abspath(trash))
+        target = _trash_key(trash)
         with self._lock:
             for task in self._tasks.values():
                 if task.state != "running":
                     continue
-                if os.path.normcase(os.path.abspath(task.trash)) == target:
+                if _trash_key(task.trash) == target:
                     return task
         return None
 
@@ -344,8 +378,10 @@ class DisposalTaskManager:
         thread.start()
         return task
 
-    def start_restore(self, target: str, options: RestoreOptions) -> DisposalTask:
-        task, lock = self._claim("restore", target, target)
+    def start_restore(
+        self, target: str, options: RestoreOptions, *, report_path: str = ""
+    ) -> DisposalTask:
+        task, lock = self._claim("restore", target, report_path)
         thread = threading.Thread(
             target=self._run_restore,
             args=(task, target, options, lock),
@@ -455,22 +491,37 @@ class DisposalTaskManager:
     ) -> None:
         # run_restore / run_empty 是给 CLI 写的，直接 print 到 stdout。Web 下把
         # 这些输出收进线程局部缓冲区，既避免污染服务端日志，也能在失败时当作诊断信息。
+        stats = RestoreStats()
+        outcome = "failed"
         try:
             task.phase = "restoring"
             with capture():
-                code = run_restore(target, options)
+                code = run_restore(target, options, stats=stats)
             task.message = "还原完成" if code == 0 else ("没有可还原的动作" if code == 1 else "部分动作失败")
-            task.state = "failed" if code == 2 else "succeeded"
+            if not stats.state_synced:
+                note = "处置状态未能同步；页面可能仍把这些组显示为已处置"
+                task.message = f"{task.message}（{note}）"
+            elif stats.unreadable_manifests:
+                task.message = f"{task.message}（跳过 {stats.unreadable_manifests} 份无法读取的记录）"
+            outcome = "failed" if code == 2 else "succeeded"
         except (RestoreError, OSError) as exc:
-            task.state = "failed"
             task.error = str(exc)
         except Exception as exc:
-            task.state = "failed"
             task.error = f"{type(exc).__name__}: {exc}"
         finally:
-            lock.release()
+            # 与 apply 一样：统计先于终态发布，前端轮询到 succeeded 时数字已经就绪
+            task.restored_files = stats.restored
+            task.restored_bytes = stats.restored_bytes
+            task.already_restored = stats.already_restored
+            task.missing_files = stats.missing
+            task.skipped_files = stats.skipped
+            task.failed_files = stats.failed
+            task.state_synced = stats.state_synced
             task.phase = "done"
             task.finished_at = time.time()
+            # 终态最后发布：轮询看到 succeeded 时其余字段都已就绪
+            task.state = outcome
+            lock.release()
 
     def _run_empty(
         self, task: DisposalTask, trash: str, options: EmptyOptions, lock: TrashLock
@@ -508,6 +559,373 @@ def _failure_detail(output: str, limit: int = 5) -> str:
     return "\n".join(shown)
 
 
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _trash_key(path: str) -> str:
+    """同一物理隔离区的 junction / 8.3 短名写法必须落到同一个键。"""
+    try:
+        return canonical(path)
+    except (OSError, ValueError):
+        return _path_key(path)
+
+
+def _manifest_report_key(document) -> str | None:
+    """manifest 的 report 只认绝对路径；相对路径是旧版产物，无法可靠归属。"""
+    if not document.report:
+        return None
+    text = document.report.replace("/", "\\")
+    drive, _ = ntpath.splitdrive(text)
+    if not ntpath.isabs(text) or not drive:
+        return None
+    try:
+        return _path_key(text)
+    except (OSError, ValueError):
+        return None
+
+
+def _restore_group_sources(document: ReportDocument) -> dict[int, frozenset[str]]:
+    """每个组的文件路径集合，用于确认 manifest 动作确实属于当前报告的该组。"""
+    return {
+        group.id: frozenset(_path_key(item.path) for item in group.files)
+        for group in document.groups
+    }
+
+
+def restore_target_groups(
+    document: ReportDocument, state: EffectiveState, group_ids: list[int] | None
+) -> list[int]:
+    """这份报告的还原目标组。
+
+    状态文件丢失时 ``load_effective_state`` 会用 manifest 回填组号；如果报告
+    被重新扫描过，回填出的旧组号可能已经不存在于当前报告。这里必须与报告
+    的组集合求交 —— 否则下游会用旧组号索引只包含报告组的映射。
+    """
+    eligible = {
+        group_id
+        for group_id, record in state.groups.items()
+        if record.state in ("handled", "partial")
+    }
+    report_group_ids = {group.id for group in document.groups}
+    if group_ids is None:
+        return sorted(eligible & report_group_ids)
+    wanted = sorted(set(group_ids))
+    for group_id in wanted:
+        if group_id not in report_group_ids:
+            raise RestoreScopeError(f"报告中不存在第 {group_id} 组")
+        if group_id not in eligible:
+            raise RestoreScopeError(f"第 {group_id} 组没有可还原的处置记录")
+    return wanted
+
+
+def restore_trash_candidates(document: ReportDocument, state: EffectiveState) -> list[str]:
+    """这份报告的处置记录可能落在哪些隔离区。
+
+    默认隔离区 + 状态文件里每条 handled/partial 记录的 manifest 父目录。
+    状态文件丢失后仍能从 manifest 回填的组也带 manifest 路径，因此自定义
+    隔离区同样能被发现；完全无法归属的旧批次由 CLI 整区还原兜底。
+    """
+    candidates: list[str] = []
+    try:
+        candidates.append(default_trash_for(document.root))
+    except RestoreError:
+        pass
+    for record in state.groups.values():
+        if record.state not in ("handled", "partial") or not record.manifest:
+            continue
+        parent = ntpath.dirname(record.manifest)
+        if parent:
+            candidates.append(parent)
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            absolute = ntpath.abspath(path)
+        except (OSError, ValueError):
+            continue
+        # 同一物理隔离区的 junction / 8.3 短名写法要合并，否则同一批
+        # manifest 会被扫描两次，crossTrashGroupIds 把每个组误判成跨隔离区。
+        try:
+            key = canonical(absolute)
+        except (OSError, ValueError):
+            key = _path_key(absolute)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(absolute)
+    return result
+
+
+def _manifest_file_size(path) -> int:
+    """预览读取上限要算上 journal：仅 journal 的崩溃记录没有快照文件。"""
+    total = 0
+    for candidate in (str(path), str(path) + JOURNAL_SUFFIX):
+        try:
+            total += os.path.getsize(candidate)
+        except OSError:
+            pass
+    return total
+
+
+def _action_kind(action, trash: str, *, cache: CanonicalCache | None = None) -> str:
+    """预览用：这个动作执行时会归入哪一类（与 _restore_one 的顺序一致）。"""
+    # 真实执行第一步就是 _validate_action；预览必须先跑同一套校验，否则
+    # 非法 dst / 受保护 src 的动作会被算进「将还原」，执行时才报失败。
+    if validate_action(action, trash, cache=cache) is not None:
+        return "rejected"
+    src_exists = os.path.exists(long_path(action.src))
+    dst_exists = os.path.exists(long_path(action.dst))
+    if src_exists and dst_exists:
+        try:
+            if os.path.samefile(long_path(action.src), long_path(action.dst)):
+                return "already"
+        except OSError:
+            pass
+        # 默认 on_conflict=skip 会跳过；rename/overwrite 才会动
+        return "conflict"
+    if src_exists and not dst_exists:
+        return "already" if action.status == "completed" else "pending"
+    if not dst_exists:
+        return "missing"
+    return "restorable"
+
+
+def build_restore_preview(
+    document: ReportDocument,
+    state: EffectiveState,
+    group_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """报告级/组级还原的只读预览：不写文件、不拿隔离区锁。
+
+    只扫描两种目录：默认隔离区，以及状态文件里记录过的 manifest 父目录。
+    不会接受任意路径，避免把用户资料目录里的同名文件当 manifest 读。
+    """
+    all_eligible = {
+        group_id
+        for group_id, record in state.groups.items()
+        if record.state in ("handled", "partial")
+    }
+    report_group_ids = {group.id for group in document.groups}
+    stale = sorted(all_eligible - report_group_ids)
+    targets = restore_target_groups(document, state, group_ids)
+    sources = _restore_group_sources(document)
+    target_set = set(targets)
+    report_key = _path_key(document.path)
+    group_files = {group_id: 0 for group_id in targets}
+    group_bytes = {group_id: 0 for group_id in targets}
+    group_trashes: dict[int, set[str]] = {group_id: set() for group_id in targets}
+    collected: list[tuple[int, str, Any, dict[str, Any]]] = []
+    unsafe: set[int] = set()
+    trashes: list[dict[str, Any]] = []
+    unscoped = 0
+    truncated = False
+
+    for trash in restore_trash_candidates(document, state):
+        bucket: dict[str, Any] = {
+            "path": trash,
+            "exists": os.path.isdir(trash),
+            "files": 0,
+            "bytes": 0,
+            "groups": 0,
+            "groupIds": [],
+            "missing": 0,
+            "alreadyRestored": 0,
+            "skippedPending": 0,
+            "conflicts": 0,
+            "rejected": 0,
+            "unreadable": 0,
+            "unscopedManifests": 0,
+            "otherReportManifests": 0,
+            "truncated": False,
+        }
+        trashes.append(bucket)
+        if not bucket["exists"]:
+            continue
+        try:
+            manifests = discover_manifests(trash)
+        except RestoreError:
+            # 目录存在但不是隔离区：可能是默认隔离区尚未创建
+            continue
+        if len(manifests) > MAX_PREVIEW_MANIFESTS:
+            manifests = manifests[:MAX_PREVIEW_MANIFESTS]
+            bucket["truncated"] = True
+            truncated = True
+        for path in manifests:
+            if len(collected) >= MAX_PREVIEW_ACTIONS:
+                bucket["truncated"] = True
+                truncated = True
+                break
+            try:
+                # journal-only 记录的「快照路径」并不存在，getsize 要看快照与
+                # journal 的总和；否则崩溃恢复记录会被当成不可读跳过。
+                if _manifest_file_size(path) > MAX_PREVIEW_MANIFEST_BYTES:
+                    bucket["unreadable"] += 1
+                    bucket["truncated"] = True
+                    truncated = True
+                    continue
+                manifest = load_manifest(path)
+            except (OSError, RestoreError):
+                bucket["unreadable"] += 1
+                continue
+            manifest_key = _manifest_report_key(manifest)
+            if manifest_key is None:
+                # 旧版相对路径 / 无 report / journal-only：无法可靠归属
+                bucket["unscopedManifests"] += 1
+                unscoped += 1
+                continue
+            if manifest_key != report_key:
+                # 同一隔离区里其他报告的批次，不是「旧格式」，不能误导用户
+                bucket["otherReportManifests"] += 1
+                continue
+            for action in manifest.restorable:
+                if action.group_id in target_set:
+                    if len(collected) >= MAX_PREVIEW_ACTIONS:
+                        bucket["truncated"] = True
+                        truncated = True
+                        break
+                    collected.append((action.group_id, trash, action, bucket))
+        if len(collected) >= MAX_PREVIEW_ACTIONS:
+            break
+
+    for group_id, _, action, _ in collected:
+        if _path_key(action.src) not in sources.get(group_id, frozenset()):
+            unsafe.add(group_id)
+
+    caches: dict[str, CanonicalCache] = {}
+    for group_id, trash, action, bucket in collected:
+        if group_id in unsafe:
+            continue
+        cache = caches.get(trash)
+        if cache is None:
+            cache = CanonicalCache()
+            caches[trash] = cache
+        kind = _action_kind(action, trash, cache=cache)
+        if kind == "restorable":
+            group_files[group_id] += 1
+            group_bytes[group_id] += action.size
+            group_trashes[group_id].add(trash)
+            bucket["files"] += 1
+            bucket["bytes"] += action.size
+            continue
+        if kind == "already":
+            bucket["alreadyRestored"] += 1
+        elif kind == "missing":
+            bucket["missing"] += 1
+        elif kind == "pending":
+            bucket["skippedPending"] += 1
+        elif kind == "rejected":
+            bucket["rejected"] += 1
+        else:
+            bucket["conflicts"] += 1
+
+    for bucket in trashes:
+        bucket["groupIds"] = sorted(
+            group_id for group_id in targets if bucket["path"] in group_trashes[group_id]
+        )
+        bucket["groups"] = len(bucket["groupIds"])
+
+    # 只要收集到任何动作（含 already/missing/conflict），这组就不算「没找到」；
+    # 纯幂等收尾的组不能同时被提示成「没有可还原的文件」。
+    seen = {group_id for group_id, _, _, _ in collected}
+    cross_trash = sorted(
+        group_id for group_id, buckets in group_trashes.items() if len(buckets) > 1
+    )
+    groups_payload = [
+        {
+            "groupId": group_id,
+            "files": group_files[group_id],
+            "bytes": group_bytes[group_id],
+            "text": format_size(group_bytes[group_id]),
+        }
+        for group_id in targets
+        if group_files[group_id] > 0
+    ]
+    total_files = sum(group_files.values())
+    total_bytes = sum(group_bytes.values())
+    return {
+        "reportPath": str(document.path),
+        "identityOk": state.identity_ok,
+        "groupIds": targets,
+        "groups": groups_payload,
+        "trashes": trashes,
+        "crossTrashGroupIds": cross_trash,
+        "unsafeGroupIds": sorted(unsafe),
+        "missingGroupIds": sorted(set(targets) - seen - unsafe),
+        "staleGroupIds": stale,
+        "unscopedManifests": unscoped,
+        "totalOtherReportManifests": sum(
+            bucket["otherReportManifests"] for bucket in trashes
+        ),
+        "truncated": truncated,
+        "totalFiles": total_files,
+        "totalBytes": total_bytes,
+        "totalText": format_size(total_bytes),
+        "totalAlready": sum(bucket["alreadyRestored"] for bucket in trashes),
+        "totalRejected": sum(bucket["rejected"] for bucket in trashes),
+        "totalUnreadable": sum(bucket["unreadable"] for bucket in trashes),
+    }
+
+
+def scan_restore_scope(
+    document: ReportDocument, trash: str, group_ids: list[int]
+) -> set[int]:
+    """返回动作与当前报告组不一致的组号（不抛错，供报告级排除）。
+
+    只靠 groupId 不够：状态文件丢失时 ``load_effective_state`` 会用旧 manifest
+    回填组号，而报告重扫后组号已经重排。动作的 ``src`` 路径是更硬的证据 ——
+    它必须出现在当前报告该组的文件列表里。
+
+    读不出来的 manifest 与执行侧一致地跳过（``run_restore`` 按报告过滤时也
+    不会读它）；超过预览上限的 manifest 执行侧却会照常读取，因此必须拒绝，
+    不能静默放行未经校验的动作。
+    """
+    sources = _restore_group_sources(document)
+    for group_id in group_ids:
+        if group_id not in sources:
+            raise RestoreScopeError(f"报告中不存在第 {group_id} 组")
+    try:
+        manifests = discover_manifests(trash)
+    except RestoreError:
+        return set()
+    if len(manifests) > MAX_PREVIEW_MANIFESTS:
+        raise RestoreScopeError(
+            f"隔离区 manifest 超过 {MAX_PREVIEW_MANIFESTS} 份，无法安全校验组归属；"
+            "请用 CLI 整区还原"
+        )
+    report_key = _path_key(document.path)
+    target_set = set(group_ids)
+    unsafe: set[int] = set()
+    for path in manifests:
+        if _manifest_file_size(path) > MAX_PREVIEW_MANIFEST_BYTES:
+            raise RestoreScopeError(
+                "隔离区里有超过读取上限的 manifest，无法校验组归属；请用 CLI 整区还原"
+            )
+        try:
+            manifest = load_manifest(path)
+        except (OSError, RestoreError):
+            continue
+        if _manifest_report_key(manifest) != report_key:
+            continue
+        for action in manifest.restorable:
+            if action.group_id in target_set and _path_key(action.src) not in sources[action.group_id]:
+                unsafe.add(action.group_id)
+    return unsafe
+
+
+def validate_restore_scope(
+    document: ReportDocument, trash: str, group_ids: list[int]
+) -> None:
+    """执行前的组级安全校验：任何组与当前报告不一致就整批拒绝。"""
+    unsafe = scan_restore_scope(document, trash, group_ids)
+    if unsafe:
+        listed = "、".join(str(group_id) for group_id in sorted(unsafe))
+        raise RestoreScopeError(
+            f"第 {listed} 组的隔离区记录与当前报告不一致"
+            "（报告可能已重新扫描），已拒绝按组还原"
+        )
+
+
 def validate_trash_path(trash: str) -> str:
     """Web 传入的隔离区路径必须是本地绝对路径（真正的安全判定在 restore.py）。
 
@@ -539,9 +957,15 @@ __all__ = [
     "DisposalTask",
     "DisposalTaskManager",
     "PreviewPayload",
+    "RestoreScopeError",
     "TrashBusy",
     "TrashLock",
     "build_preview",
+    "build_restore_preview",
     "default_trash_for",
+    "restore_target_groups",
+    "restore_trash_candidates",
+    "scan_restore_scope",
+    "validate_restore_scope",
     "validate_trash_path",
 ]
